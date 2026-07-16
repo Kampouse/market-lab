@@ -11,26 +11,29 @@ use crate::commands::script::{
     ScriptDescriptor, ScriptInputs, report_builder, write_report_best_effort,
     write_running_report_best_effort,
 };
-use crate::commands::study::common::is_empty_object;
+use crate::commands::study::common::{is_empty_object, provider_name};
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::OrderBookSnapshot;
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::mmt::MmtProvider;
-use crate::scripting::engine::{Script, ScriptSession};
+use crate::scripting::engine::Script;
 use crate::scripting::execution::{
     ScriptCancelRequest, ScriptExecutionCommand, ScriptExecutionContext, ScriptOrderKind,
     ScriptOrderRef, ScriptTradeRequest,
 };
 use crate::scripting::inputs::{
     SourceConfig, SourceConfigs, first_source_config, parse_param_values, parse_source_configs,
-    resolve_params, source_configs_payload, source_exchange_label, source_provider_label,
+    populate_source_defaults, resolve_params, source_exchange_label, validate_bulk_source_configs,
     validate_source_configs,
 };
+use crate::scripting::limits::SCRIPT_DEFAULT_LOOKBACK_CANDLES;
 use crate::scripting::manifest::ScriptSource;
 use crate::scripting::market_data::{
     ScriptCandle, ScriptOpenInterest, ScriptVolume, ScriptVolumeDelta,
 };
 use tokio::task::JoinHandle;
+
+use super::run::default_script_exchange;
 
 #[derive(Debug, Clone, Serialize)]
 struct ScriptBacktestResult<I>
@@ -39,7 +42,7 @@ where
 {
     r#type: &'static str,
     version: &'static str,
-    provider: String,
+    provider: &'static str,
     exchange: String,
     symbol: String,
     ts_ms: u64,
@@ -50,8 +53,7 @@ where
     performance: ScriptBacktestPerformance,
     closed_trades: Vec<ScriptBacktestTrade>,
     open_positions: Vec<ScriptBacktestOpenPosition>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    latest_output: Option<ScriptBacktestLatestOutput>,
+    latest_output: ScriptBacktestLatestOutput,
     meta: Value,
 }
 
@@ -62,7 +64,7 @@ where
 {
     r#type: &'static str,
     version: &'static str,
-    provider: &'a str,
+    provider: &'static str,
     exchange: &'a str,
     symbol: &'a str,
     ts_ms: u64,
@@ -82,6 +84,7 @@ struct ScriptWindow {
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct ScriptBacktestSummary {
+    signals: usize,
     orders: usize,
     pending_orders: usize,
     cancelled_orders: usize,
@@ -207,6 +210,8 @@ struct TradeEvent {
     ts_ms: u64,
     price: f64,
     reason: String,
+    notional: Option<f64>,
+    position_id: Option<String>,
 }
 
 struct TradeEntry {
@@ -222,10 +227,19 @@ struct TradeEntry {
     take_profit_price: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+enum TradeAction {
+    OpenLong,
+    OpenShort,
+    Close,
+    CloseAll,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ScriptBacktestLatestOutput {
     metrics: Value,
-    meta: Value,
+    signal: Value,
+    intent: Value,
 }
 
 #[derive(Default)]
@@ -241,65 +255,26 @@ enum BacktestSeries {
     Volumes(Vec<ScriptVolume>),
 }
 
-#[derive(Default)]
-struct BacktestHistoryCursors {
-    next: BTreeMap<String, usize>,
-}
-
-impl BacktestHistoryCursors {
-    fn sync(
-        &mut self,
-        session: &ScriptSession,
-        data: &BacktestData,
-        source_configs: &SourceConfigs,
-        clock: &SourceConfig,
-        clock_idx: usize,
-        cutoff_ms: u64,
-    ) -> Result<()> {
-        let mut configs = source_configs.values().collect::<Vec<_>>();
-        configs.sort_by_key(|config| config.position);
-        for config in configs {
-            let series = data
-                .series
-                .get(&config.selector)
-                .with_context(|| format!("{} data not loaded", config.selector))?;
-            let next = self.next.entry(config.selector.clone()).or_default();
-            let end = if config.selector == clock.selector {
-                clock_idx + 1
-            } else {
-                let mut end = *next;
-                while end < backtest_series_len(series)
-                    && backtest_series_ts_ms(series, end)? <= cutoff_ms
-                {
-                    end += 1;
-                }
-                end
-            };
-            while *next < end {
-                let (record, identity) = backtest_history_record(series, *next)?;
-                session.record_source(&config.selector, record, identity)?;
-                *next += 1;
-            }
-        }
-        Ok(())
-    }
-}
-
 pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
     args.validate()?;
+    if matches!(args.provider.into(), ProviderKind::MarketLab) {
+        bail!("script backtest supports --provider mmt|bulk");
+    }
     if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
         bail!("script backtest currently supports only --output terminal|json|jsonl");
     }
 
     let script = Script::load(&args.script)?;
+    let provider: ProviderKind = args.provider.into();
+    let default_exchange = default_script_exchange(provider, args.exchange.as_deref())?;
     let mut report = report_builder(
         "script.backtest",
         &script,
-        None,
-        None,
+        Some(provider_name(provider).to_string()),
+        default_exchange.clone(),
         Some(args.symbol.clone()),
     );
-    let source_configs = match parse_source_configs(&args.source) {
+    let mut source_configs = match parse_source_configs(&args.source, default_exchange.as_deref()) {
         Ok(configs) => configs,
         Err(err) => {
             let runtime_report = report.finish_error(&err);
@@ -307,13 +282,19 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
             return Err(err);
         }
     };
-    let source_validation = validate_source_configs(&script.manifest, &source_configs);
+    let source_validation = match args.provider.into() {
+        ProviderKind::Mmt => validate_source_configs(&script.manifest, &source_configs),
+        ProviderKind::Bulk => {
+            populate_source_defaults(&script.manifest, &mut source_configs, "bulk");
+            validate_bulk_source_configs(&script.manifest, &source_configs, true)
+        }
+        ProviderKind::MarketLab => unreachable!(),
+    };
     if let Err(err) = source_validation {
         let runtime_report = report.finish_error(&err);
         write_report_best_effort(&runtime_report);
         return Err(err);
     }
-    report.set_provider(Some(source_provider_label(&source_configs)));
     report.set_exchange(Some(source_exchange_label(&source_configs)));
 
     let raw_params = match parse_param_values(&args.param) {
@@ -361,12 +342,13 @@ async fn backtest_window(
     }
 
     let mut returns = Vec::new();
+    let mut signals = 0_usize;
     let mut orders = 0_usize;
     let mut closed_trades = Vec::new();
     let mut open_trades = Vec::new();
     let mut script_orders = HashMap::<String, SimulatedScriptOrder>::new();
     let mut next_position_id = 1_usize;
-    let mut saw_execution_action = false;
+    let mut saw_strategy_like_output = false;
     let mut latest_output = None;
     let session = script.start_session_with_execution(
         &resolved_params,
@@ -382,9 +364,7 @@ async fn backtest_window(
         }
     }));
 
-    let lookback = script.history_capacity(&resolved_params);
-    let provider_label = source_provider_label(&source_configs);
-    let mut history_cursors = BacktestHistoryCursors::default();
+    let lookback = effective_lookback(&script, &resolved_params);
     eprintln!(
         "running script={} sources={} clock={} records={} lookback={}",
         script.manifest.name,
@@ -403,7 +383,6 @@ async fn backtest_window(
         }
 
         let cutoff = clock_ts_ms(&clock, &data, idx)?;
-        history_cursors.sync(&session, &data, &source_configs, &clock, idx, cutoff)?;
         apply_protective_triggers(&clock, &data, idx, &mut open_trades, &mut closed_trades)?;
         fill_pending_script_orders(
             &clock,
@@ -414,13 +393,14 @@ async fn backtest_window(
             &mut next_position_id,
         )?;
         let payload = build_window_payload(WindowPayloadContext {
+            data: &data,
             source_configs: &source_configs,
-            provider: &provider_label,
+            provider: provider_name(args.provider.into()),
             symbol: &args.symbol,
             clock: &clock,
             clock_idx: idx,
             cutoff_ms: cutoff,
-            mark_price: clock_price(&clock, &data, idx)?,
+            lookback,
             open_trades: &open_trades,
         })?;
         let execution = match session.run_window(payload) {
@@ -438,6 +418,34 @@ async fn backtest_window(
         let commands = execution.commands;
         let output = execution.output;
 
+        let has_signal = !is_empty_json_object(&output.signal);
+        let has_intent = !is_empty_json_object(&output.intent);
+        if has_signal || has_intent {
+            saw_strategy_like_output = true;
+        }
+        if triggered_output(&output.signal, &output.intent) {
+            signals += usize::from(has_signal);
+            orders += usize::from(has_intent);
+            if let Some(action) = action_from_output(&output.signal, &output.intent) {
+                let event = TradeEvent {
+                    idx,
+                    ts_ms: clock_ts_ms(&clock, &data, idx)?,
+                    price: clock_price(&clock, &data, idx)?,
+                    reason: reason_from_output(&output.signal, &output.intent),
+                    notional: notional_from_output(&output.intent),
+                    position_id: position_id_from_output(&output.intent),
+                };
+                apply_trade_action(
+                    action,
+                    &mut open_trades,
+                    &mut closed_trades,
+                    &mut next_position_id,
+                    event,
+                    args.leverage,
+                )?;
+            }
+        }
+
         let script_order_count = apply_script_execution_commands(
             commands,
             idx,
@@ -448,19 +456,18 @@ async fn backtest_window(
             &mut next_position_id,
         )?;
         if script_order_count > 0 {
-            saw_execution_action = true;
+            saw_strategy_like_output = true;
             orders += script_order_count;
         }
 
         let curr = clock_price(&clock, &data, idx)?;
         let next = clock_price(&clock, &data, idx + 1)?;
         returns.push(position_return(&open_trades, curr, next));
-        if !output.is_empty() {
-            latest_output = Some(ScriptBacktestLatestOutput {
-                metrics: output.metrics,
-                meta: output.meta,
-            });
-        }
+        latest_output = Some(ScriptBacktestLatestOutput {
+            metrics: output.metrics,
+            signal: output.signal,
+            intent: output.intent,
+        });
 
         if (idx + 1) % 500 == 0 || idx + 2 == clock_len {
             eprintln!(
@@ -474,8 +481,10 @@ async fn backtest_window(
         }
     }
 
-    if !saw_execution_action {
-        bail!("script backtest requires an execution action: call `ctx.trade()`");
+    if !saw_strategy_like_output {
+        bail!(
+            "script backtest requires an execution action: call `ctx.trade()` or return `signal`/`intent`"
+        );
     }
 
     let timeframe_sec = source_configs
@@ -488,13 +497,19 @@ async fn backtest_window(
         open_trades_to_positions(&open_trades, clock_len - 1, mark_ts_ms, mark_price)
             .into_iter()
             .collect::<Vec<_>>();
-    let summary = backtest_summary(orders, &script_orders, &closed_trades, &open_positions);
+    let summary = backtest_summary(
+        signals,
+        orders,
+        &script_orders,
+        &closed_trades,
+        &open_positions,
+    );
     let performance =
         backtest_performance(&returns, &closed_trades, &open_positions, args.leverage);
     let result = ScriptBacktestResult {
         r#type: "script.backtest.result",
         version: "1",
-        provider: provider_label,
+        provider: provider_name(args.provider.into()),
         exchange: clock.exchange.clone(),
         symbol: args.symbol.clone(),
         ts_ms: mark_ts_ms,
@@ -504,7 +519,7 @@ async fn backtest_window(
                 .manifest
                 .sources
                 .iter()
-                .map(|source| source.as_str().to_string())
+                .map(ScriptSource::as_str)
                 .collect(),
         },
         window: ScriptWindow {
@@ -519,7 +534,11 @@ async fn backtest_window(
         performance,
         closed_trades,
         open_positions,
-        latest_output,
+        latest_output: latest_output.unwrap_or(ScriptBacktestLatestOutput {
+            metrics: json!({}),
+            signal: json!({}),
+            intent: json!({}),
+        }),
         meta: json!({
             "clock": clock.selector,
             "source_data": {
@@ -537,28 +556,11 @@ async fn fetch_sources(
     source_configs: &SourceConfigs,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<BacktestData> {
-    let mut data = BacktestData::default();
-    if source_configs
-        .values()
-        .any(|config| config.provider == ProviderKind::Mmt)
-    {
-        data.series.extend(
-            fetch_mmt_sources(args, source_configs, report)
-                .await?
-                .series,
-        );
+    match args.provider.into() {
+        ProviderKind::Mmt => fetch_mmt_sources(args, source_configs, report).await,
+        ProviderKind::Bulk => fetch_bulk_sources(args, source_configs, report).await,
+        ProviderKind::MarketLab => bail!("script backtest supports --provider mmt|bulk"),
     }
-    if source_configs
-        .values()
-        .any(|config| config.provider == ProviderKind::Bulk)
-    {
-        data.series.extend(
-            fetch_bulk_sources(args, source_configs, report)
-                .await?
-                .series,
-        );
-    }
-    Ok(data)
 }
 
 async fn fetch_mmt_sources(
@@ -569,7 +571,6 @@ async fn fetch_mmt_sources(
     let mut data = BacktestData::default();
     let mut cancel = Box::pin(tokio::signal::ctrl_c());
     let mut configs = source_configs.values().collect::<Vec<_>>();
-    configs.retain(|config| config.provider == ProviderKind::Mmt);
     configs.sort_by_key(|config| config.position);
 
     for config in configs {
@@ -793,7 +794,6 @@ async fn fetch_bulk_sources(
     let mut cancel = Box::pin(tokio::signal::ctrl_c());
 
     let mut configs = source_configs.values().collect::<Vec<_>>();
-    configs.retain(|config| config.provider == ProviderKind::Bulk);
     configs.sort_by_key(|config| config.position);
     for config in configs {
         let source = &config.source;
@@ -873,13 +873,14 @@ async fn fetch_bulk_sources(
 }
 
 struct WindowPayloadContext<'a> {
+    data: &'a BacktestData,
     source_configs: &'a SourceConfigs,
     provider: &'a str,
     symbol: &'a str,
     clock: &'a SourceConfig,
     clock_idx: usize,
     cutoff_ms: u64,
-    mark_price: f64,
+    lookback: usize,
     open_trades: &'a [OpenTrade],
 }
 
@@ -899,68 +900,105 @@ fn build_window_payload(ctx: WindowPayloadContext<'_>) -> Result<Value> {
         "clock".to_string(),
         Value::String(ctx.clock.selector.clone()),
     );
-    root.insert(
-        "source_configs".to_string(),
-        source_configs_payload(ctx.source_configs),
-    );
-    let open_positions = open_trades_to_positions(
-        ctx.open_trades,
-        ctx.clock_idx,
-        ctx.cutoff_ms,
-        ctx.mark_price,
-    );
+
+    let mut sources = Map::new();
+    let mut configs = ctx.source_configs.values().collect::<Vec<_>>();
+    configs.sort_by_key(|config| config.position);
+    for config in configs {
+        let series = ctx
+            .data
+            .series
+            .get(&config.selector)
+            .with_context(|| format!("{} data not loaded", config.selector))?;
+        let envelope = match (config.source.clone(), series) {
+            (ScriptSource::Candles, BacktestSeries::Candles(candles)) => {
+                let end = if config.selector == ctx.clock.selector {
+                    ctx.clock_idx + 1
+                } else {
+                    upper_bound_by_ts(candles, ctx.cutoff_ms, candle_ts_ms)
+                };
+                let start = end.saturating_sub(ctx.lookback);
+                json!({ "candles": &candles[start..end] })
+            }
+            (ScriptSource::Orderbook, BacktestSeries::Orderbooks(books)) => {
+                let end = if config.selector == ctx.clock.selector {
+                    ctx.clock_idx + 1
+                } else {
+                    upper_bound_by_ts(books, ctx.cutoff_ms, |book| book.timestamp_ms)
+                };
+                let start = end.saturating_sub(ctx.lookback);
+                json!({ "books": &books[start..end] })
+            }
+            (ScriptSource::Vd, BacktestSeries::Vd(candles)) => {
+                let end = if config.selector == ctx.clock.selector {
+                    ctx.clock_idx + 1
+                } else {
+                    upper_bound_by_ts(candles, ctx.cutoff_ms, vd_ts_ms)
+                };
+                let start = end.saturating_sub(ctx.lookback);
+                let slice = &candles[start..end];
+                json!({
+                    "candles": slice,
+                    "records": slice,
+                    "bucket": config.require_bucket(&config.source)?,
+                    "timeframe_sec": config.require_timeframe(&config.source)?,
+                })
+            }
+            (ScriptSource::Oi, BacktestSeries::Oi(candles)) => {
+                let end = if config.selector == ctx.clock.selector {
+                    ctx.clock_idx + 1
+                } else {
+                    upper_bound_by_ts(candles, ctx.cutoff_ms, oi_ts_ms)
+                };
+                let start = end.saturating_sub(ctx.lookback);
+                let slice = &candles[start..end];
+                json!({
+                    "candles": slice,
+                    "records": slice,
+                    "timeframe_sec": config.require_timeframe(&config.source)?,
+                })
+            }
+            (ScriptSource::Volumes, BacktestSeries::Volumes(profiles)) => {
+                let end = if config.selector == ctx.clock.selector {
+                    ctx.clock_idx + 1
+                } else {
+                    upper_bound_by_ts(profiles, ctx.cutoff_ms, volume_ts_ms)
+                };
+                let start = end.saturating_sub(ctx.lookback);
+                let slice = &profiles[start..end];
+                json!({
+                    "profiles": slice,
+                    "records": slice,
+                    "timeframe_sec": config.require_timeframe(&config.source)?,
+                })
+            }
+            _ => bail!("{} data type does not match its source", config.selector),
+        };
+        sources.insert(config.selector.clone(), envelope.clone());
+        let same_kind = ctx
+            .source_configs
+            .values()
+            .filter(|candidate| candidate.source == config.source)
+            .count();
+        if same_kind == 1 {
+            root.insert(config.source.as_str().to_string(), envelope);
+        }
+    }
+    root.insert("sources".to_string(), Value::Object(sources));
+
+    let mark_price = clock_price(ctx.clock, ctx.data, ctx.clock_idx)?;
+    let open_positions =
+        open_trades_to_positions(ctx.open_trades, ctx.clock_idx, ctx.cutoff_ms, mark_price);
     root.insert("positions".to_string(), json!({ "open": open_positions }));
 
     Ok(Value::Object(root))
 }
 
-fn backtest_series_len(series: &BacktestSeries) -> usize {
-    match series {
-        BacktestSeries::Candles(items) => items.len(),
-        BacktestSeries::Orderbooks(items) => items.len(),
-        BacktestSeries::Vd(items) => items.len(),
-        BacktestSeries::Oi(items) => items.len(),
-        BacktestSeries::Volumes(items) => items.len(),
-    }
-}
-
-fn backtest_series_ts_ms(series: &BacktestSeries, idx: usize) -> Result<u64> {
-    match series {
-        BacktestSeries::Candles(items) => items
-            .get(idx)
-            .map(candle_ts_ms)
-            .context("candle history index is out of range"),
-        BacktestSeries::Orderbooks(items) => items
-            .get(idx)
-            .map(|item| item.timestamp_ms)
-            .context("orderbook history index is out of range"),
-        BacktestSeries::Vd(items) => items
-            .get(idx)
-            .map(vd_ts_ms)
-            .context("vd history index is out of range"),
-        BacktestSeries::Oi(items) => items
-            .get(idx)
-            .map(oi_ts_ms)
-            .context("oi history index is out of range"),
-        BacktestSeries::Volumes(items) => items
-            .get(idx)
-            .map(volume_ts_ms)
-            .context("volumes history index is out of range"),
-    }
-}
-
-fn backtest_history_record(series: &BacktestSeries, idx: usize) -> Result<(Value, Option<u64>)> {
-    let ts_ms = backtest_series_ts_ms(series, idx)?;
-    let record = match series {
-        BacktestSeries::Candles(items) => serde_json::to_value(&items[idx]),
-        BacktestSeries::Orderbooks(items) => serde_json::to_value(&items[idx]),
-        BacktestSeries::Vd(items) => serde_json::to_value(&items[idx]),
-        BacktestSeries::Oi(items) => serde_json::to_value(&items[idx]),
-        BacktestSeries::Volumes(items) => serde_json::to_value(&items[idx]),
-    }
-    .context("failed to serialize backtest history record")?;
-    let identity = (!matches!(series, BacktestSeries::Orderbooks(_))).then_some(ts_ms);
-    Ok((record, identity))
+fn upper_bound_by_ts<T>(items: &[T], cutoff_ms: u64, ts: impl Fn(&T) -> u64) -> usize {
+    items
+        .iter()
+        .position(|item| ts(item) > cutoff_ms)
+        .unwrap_or(items.len())
 }
 
 fn clock_len(clock: &SourceConfig, data: &BacktestData) -> Result<usize> {
@@ -1045,6 +1083,24 @@ fn book_mid(book: &OrderBookSnapshot) -> Result<f64> {
     Ok((bid + ask) / 2.0)
 }
 
+fn effective_lookback(script: &Script, resolved_params: &Value) -> usize {
+    if let Some(lookback) = script.manifest.lookback {
+        return lookback;
+    }
+
+    resolved_params
+        .as_object()
+        .and_then(|params| {
+            params
+                .values()
+                .find_map(|source| source.get("lookback").and_then(Value::as_f64))
+        })
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .map(|value| value.floor() as usize)
+        .unwrap_or(SCRIPT_DEFAULT_LOOKBACK_CANDLES)
+        .min(SCRIPT_DEFAULT_LOOKBACK_CANDLES)
+}
+
 #[derive(Debug)]
 struct ScriptCancelled;
 
@@ -1062,6 +1118,74 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+fn triggered_output(signal: &Value, intent: &Value) -> bool {
+    signal
+        .get("triggered")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| !is_empty_json_object(intent))
+}
+
+fn action_from_output(signal: &Value, intent: &Value) -> Option<TradeAction> {
+    let action = signal
+        .get("action")
+        .or_else(|| signal.get("event"))
+        .or_else(|| intent.get("action"))
+        .and_then(Value::as_str);
+    match action {
+        Some("open_long" | "enter_long" | "long" | "buy") => return Some(TradeAction::OpenLong),
+        Some("open_short" | "enter_short" | "short" | "sell") => {
+            return Some(TradeAction::OpenShort);
+        }
+        Some("open") => return side_to_open_action(output_side(signal, intent)?),
+        Some("close") => return Some(TradeAction::Close),
+        Some("close_all") => return Some(TradeAction::CloseAll),
+        _ => {}
+    }
+
+    let side = output_side(signal, intent)?;
+    side_to_open_action(side)
+}
+
+fn output_side<'a>(signal: &'a Value, intent: &'a Value) -> Option<&'a str> {
+    intent
+        .get("side")
+        .or_else(|| signal.get("side"))
+        .and_then(Value::as_str)
+}
+
+fn side_to_open_action(side: &str) -> Option<TradeAction> {
+    match side {
+        "buy" | "long" => Some(TradeAction::OpenLong),
+        "sell" | "short" => Some(TradeAction::OpenShort),
+        _ => None,
+    }
+}
+
+fn reason_from_output(signal: &Value, intent: &Value) -> String {
+    signal
+        .get("reason")
+        .or_else(|| intent.get("reason"))
+        .or_else(|| signal.get("event"))
+        .and_then(Value::as_str)
+        .unwrap_or("script signal")
+        .to_string()
+}
+
+fn notional_from_output(intent: &Value) -> Option<f64> {
+    intent
+        .get("notional")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn position_id_from_output(intent: &Value) -> Option<String> {
+    intent
+        .get("position_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
 }
 
 fn apply_script_execution_commands(
@@ -1304,6 +1428,8 @@ fn apply_protective_triggers(
                 ts_ms,
                 price,
                 reason,
+                notional: None,
+                position_id: None,
             },
         );
     }
@@ -1345,6 +1471,63 @@ fn protective_trigger(
     Ok(take_profit_hit.map(|price| (price, "ctx.trade take profit".to_string())))
 }
 
+fn apply_trade_action(
+    action: TradeAction,
+    open_trades: &mut Vec<OpenTrade>,
+    closed_trades: &mut Vec<ScriptBacktestTrade>,
+    next_position_id: &mut usize,
+    event: TradeEvent,
+    leverage: f64,
+) -> Result<()> {
+    match action {
+        TradeAction::OpenLong => {
+            open_trades.push(open_trade_from_entry(
+                next_position_id,
+                TradeEntry {
+                    side: TradeSide::Long,
+                    idx: event.idx,
+                    ts_ms: event.ts_ms,
+                    price: event.price,
+                    reason: event.reason,
+                    notional: event.notional,
+                    leverage,
+                    order_id: None,
+                    stop_loss_price: None,
+                    take_profit_price: None,
+                },
+            ));
+        }
+        TradeAction::OpenShort => {
+            open_trades.push(open_trade_from_entry(
+                next_position_id,
+                TradeEntry {
+                    side: TradeSide::Short,
+                    idx: event.idx,
+                    ts_ms: event.ts_ms,
+                    price: event.price,
+                    reason: event.reason,
+                    notional: event.notional,
+                    leverage,
+                    order_id: None,
+                    stop_loss_price: None,
+                    take_profit_price: None,
+                },
+            ));
+        }
+        TradeAction::Close => {
+            let position_id = event
+                .position_id
+                .as_deref()
+                .context("close intent requires `position_id`")?;
+            close_position_by_id(open_trades, closed_trades, position_id, &event, leverage)?;
+        }
+        TradeAction::CloseAll => {
+            close_all_positions(open_trades, closed_trades, &event, leverage);
+        }
+    }
+    Ok(())
+}
+
 fn open_trade_from_entry(next_position_id: &mut usize, entry: TradeEntry) -> OpenTrade {
     let id = format_position_id(*next_position_id);
     *next_position_id += 1;
@@ -1367,6 +1550,33 @@ fn open_trade_from_entry(next_position_id: &mut usize, entry: TradeEntry) -> Ope
         stop_loss_price: entry.stop_loss_price,
         take_profit_price: entry.take_profit_price,
         reason: entry.reason,
+    }
+}
+
+fn close_position_by_id(
+    open_trades: &mut Vec<OpenTrade>,
+    closed_trades: &mut Vec<ScriptBacktestTrade>,
+    position_id: &str,
+    event: &TradeEvent,
+    _leverage: f64,
+) -> Result<()> {
+    let Some(index) = open_trades.iter().position(|trade| trade.id == position_id) else {
+        bail!("cannot close unknown position_id `{position_id}`");
+    };
+    let open = open_trades.remove(index);
+    close_open_trade(open, closed_trades, event);
+    Ok(())
+}
+
+fn close_all_positions(
+    open_trades: &mut Vec<OpenTrade>,
+    closed_trades: &mut Vec<ScriptBacktestTrade>,
+    event: &TradeEvent,
+    _leverage: f64,
+) {
+    let trades = std::mem::take(open_trades);
+    for open in trades {
+        close_open_trade(open, closed_trades, event);
     }
 }
 
@@ -1482,6 +1692,7 @@ fn format_trade_id(id: usize) -> String {
 }
 
 fn backtest_summary(
+    signals: usize,
     orders: usize,
     script_orders: &HashMap<String, SimulatedScriptOrder>,
     trades: &[ScriptBacktestTrade],
@@ -1495,6 +1706,7 @@ fn backtest_summary(
         Some(wins as f64 / trades.len() as f64)
     };
     ScriptBacktestSummary {
+        signals,
         orders,
         pending_orders: script_orders
             .values()
@@ -1576,6 +1788,10 @@ fn backtest_performance(
     }
 }
 
+fn is_empty_json_object(value: &Value) -> bool {
+    matches!(value, Value::Object(map) if map.is_empty())
+}
+
 fn render_backtest(
     result: &ScriptBacktestResult<ScriptInputs>,
     output: OutputFormat,
@@ -1597,7 +1813,8 @@ fn render_backtest(
             println!();
             println!("summary");
             println!(
-                "  orders: {}\n  pending/cancelled orders: {}/{}\n  closed trades: {}\n  open positions: {}\n  wins/losses: {}/{}\n  win rate: {}",
+                "  signals: {}\n  orders: {}\n  pending/cancelled orders: {}/{}\n  closed trades: {}\n  open positions: {}\n  wins/losses: {}/{}\n  win rate: {}",
+                result.summary.signals,
                 result.summary.orders,
                 result.summary.pending_orders,
                 result.summary.cancelled_orders,
@@ -1672,11 +1889,11 @@ fn render_backtest(
                     );
                 }
             }
-            if verbose && let Some(latest_output) = &result.latest_output {
+            if verbose {
                 println!();
                 println!(
                     "latest_output: {}",
-                    serde_json::to_string_pretty(latest_output)?
+                    serde_json::to_string_pretty(&result.latest_output)?
                 );
             }
         }
@@ -1704,7 +1921,7 @@ where
         let compact = CompactScriptBacktestResult {
             r#type: result.r#type,
             version: result.version,
-            provider: &result.provider,
+            provider: result.provider,
             exchange: &result.exchange,
             symbol: &result.symbol,
             ts_ms: result.ts_ms,
@@ -1812,9 +2029,8 @@ mod tests {
 
     fn candle_clock() -> SourceConfig {
         SourceConfig {
-            selector: "candles@binancef@mmt".to_string(),
+            selector: "candles".to_string(),
             source: ScriptSource::Candles,
-            provider: ProviderKind::Mmt,
             exchange: "binancef".to_string(),
             position: 0,
             timeframe: Some(60),
@@ -1825,10 +2041,7 @@ mod tests {
 
     fn candle_data(candles: Vec<ScriptCandle>) -> BacktestData {
         BacktestData {
-            series: BTreeMap::from([(
-                "candles@binancef@mmt".to_string(),
-                BacktestSeries::Candles(candles),
-            )]),
+            series: BTreeMap::from([("candles".to_string(), BacktestSeries::Candles(candles))]),
         }
     }
 
@@ -1859,151 +2072,135 @@ mod tests {
         ScriptExecutionCommand::Trade { order, request }
     }
 
+    fn event(idx: usize, price: f64, position_id: Option<&str>) -> TradeEvent {
+        TradeEvent {
+            idx,
+            ts_ms: 1_780_000_000_000 + idx as u64,
+            price,
+            reason: "test".to_string(),
+            notional: Some(1_000.0),
+            position_id: position_id.map(ToString::to_string),
+        }
+    }
+
     #[test]
-    fn window_payload_exposes_source_metadata_without_source_records() {
-        let configs = parse_source_configs(&[
-            "candles@binancef@mmt:timeframe=60".to_string(),
-            "candles@okx@mmt:timeframe=60".to_string(),
-        ])
+    fn window_payload_keeps_same_kind_exchanges_separate() {
+        let configs = parse_source_configs(
+            &[
+                "candles@binancef:timeframe=60".to_string(),
+                "candles@okx:timeframe=60".to_string(),
+            ],
+            None,
+        )
         .expect("parse source configs");
-        let clock = &configs["candles@binancef@mmt"];
+        let clock = &configs["candles@binancef"];
         let data = BacktestData {
             series: BTreeMap::from([
                 (
-                    "candles@binancef@mmt".to_string(),
+                    "candles@binancef".to_string(),
                     BacktestSeries::Candles(vec![candle(0, 10.0, 10.0, 10.0, 10.0)]),
                 ),
                 (
-                    "candles@okx@mmt".to_string(),
+                    "candles@okx".to_string(),
                     BacktestSeries::Candles(vec![candle(0, 20.0, 20.0, 20.0, 20.0)]),
                 ),
             ]),
         };
 
         let payload = build_window_payload(WindowPayloadContext {
+            data: &data,
             source_configs: &configs,
             provider: "mmt",
             symbol: "BTC/USDT",
             clock,
             clock_idx: 0,
             cutoff_ms: clock_ts_ms(clock, &data, 0).unwrap(),
-            mark_price: clock_price(clock, &data, 0).unwrap(),
+            lookback: 2,
             open_trades: &[],
         })
         .expect("build window payload");
 
-        assert_eq!(payload["clock"], "candles@binancef@mmt");
+        assert_eq!(payload["clock"], "candles@binancef");
         assert_eq!(payload["exchange"], "binancef");
         assert_eq!(
-            payload["source_configs"]["candles@binancef@mmt"]["exchange"],
-            "binancef"
+            payload["sources"]["candles@binancef"]["candles"][0]["c"],
+            10.0
         );
-        assert_eq!(
-            payload["source_configs"]["candles@okx@mmt"]["exchange"],
-            "okx"
-        );
-        assert!(payload.get("sources").is_none());
+        assert_eq!(payload["sources"]["candles@okx"]["candles"][0]["c"], 20.0);
         assert!(payload.get("candles").is_none());
     }
 
     #[test]
-    fn backtest_history_is_incremental_and_exchange_qualified() {
-        let path =
-            std::env::temp_dir().join(format!("mlab-backtest-history-{}.js", std::process::id()));
-        std::fs::write(
-            &path,
-            r#"
-export const script = {
-  name: "backtest-history",
-  version: "1",
-  sources: ["candles"],
-  clock: "candles",
-  lookback: 3,
-  params: {}
-};
+    fn closes_only_requested_position_id() {
+        let mut open_trades = Vec::new();
+        let mut closed_trades = Vec::new();
+        let mut next_position_id = 1;
 
-export function onData(ctx, input, history) {
-  const binance = history.source("candles@binancef@mmt");
-  const okx = history.source("candles@okx@mmt");
-  return {
-    metrics: {
-      binance: binance.map((candle) => candle.c),
-      okx: okx.map((candle) => candle.c),
-      current: history.source("candles@binancef@mmt", 0)?.c ?? null,
-      previous: history.source("candles@binancef@mmt", 1)?.c ?? null,
-      has_legacy_input: input.candles !== undefined || input.sources !== undefined
-    }
-  };
-}
-"#,
+        apply_trade_action(
+            TradeAction::OpenLong,
+            &mut open_trades,
+            &mut closed_trades,
+            &mut next_position_id,
+            event(0, 100.0, None),
+            5.0,
         )
-        .expect("write history script");
+        .expect("open first position");
+        apply_trade_action(
+            TradeAction::OpenLong,
+            &mut open_trades,
+            &mut closed_trades,
+            &mut next_position_id,
+            event(1, 110.0, None),
+            5.0,
+        )
+        .expect("open second position");
 
-        let script = Script::load(&path).expect("load history script");
-        let configs = parse_source_configs(&[
-            "candles@binancef@mmt:timeframe=60".to_string(),
-            "candles@okx@mmt:timeframe=60".to_string(),
-        ])
-        .expect("parse source configs");
-        let clock = &configs["candles@binancef@mmt"];
-        let data = BacktestData {
-            series: BTreeMap::from([
-                (
-                    "candles@binancef@mmt".to_string(),
-                    BacktestSeries::Candles(vec![
-                        candle(0, 10.0, 10.0, 10.0, 10.0),
-                        candle(1, 11.0, 11.0, 11.0, 11.0),
-                    ]),
-                ),
-                (
-                    "candles@okx@mmt".to_string(),
-                    BacktestSeries::Candles(vec![
-                        candle(0, 20.0, 20.0, 20.0, 20.0),
-                        candle(1, 21.0, 21.0, 21.0, 21.0),
-                    ]),
-                ),
-            ]),
-        };
-        let session = script.start_session(&json!({})).expect("start session");
-        let mut cursors = BacktestHistoryCursors::default();
+        apply_trade_action(
+            TradeAction::Close,
+            &mut open_trades,
+            &mut closed_trades,
+            &mut next_position_id,
+            event(2, 120.0, Some("pos_000001")),
+            5.0,
+        )
+        .expect("close exact position");
 
-        cursors
-            .sync(
-                &session,
-                &data,
-                &configs,
-                clock,
-                0,
-                clock_ts_ms(clock, &data, 0).unwrap(),
-            )
-            .expect("sync first bar");
-        let first = session
-            .run_window(json!({ "mode": "window" }))
-            .expect("run first hook");
-        assert_eq!(first.output.metrics["binance"], json!([10]));
-        assert_eq!(first.output.metrics["okx"], json!([20]));
-        assert!(first.output.metrics["previous"].is_null());
+        assert_eq!(closed_trades.len(), 1);
+        assert_eq!(closed_trades[0].id, "trade_000001");
+        assert_eq!(closed_trades[0].position_id, "pos_000001");
+        assert_eq!(open_trades.len(), 1);
+        assert_eq!(open_trades[0].id, "pos_000002");
+    }
 
-        cursors
-            .sync(
-                &session,
-                &data,
-                &configs,
-                clock,
-                1,
-                clock_ts_ms(clock, &data, 1).unwrap(),
-            )
-            .expect("sync second bar");
-        let second = session
-            .run_window(json!({ "mode": "window" }))
-            .expect("run second hook");
-        assert_eq!(second.output.metrics["binance"], json!([10, 11]));
-        assert_eq!(second.output.metrics["okx"], json!([20, 21]));
-        assert_eq!(second.output.metrics["current"], 11.0);
-        assert_eq!(second.output.metrics["previous"], 10.0);
-        assert_eq!(second.output.metrics["has_legacy_input"], false);
+    #[test]
+    fn rejects_close_without_position_id() {
+        let mut open_trades = Vec::new();
+        let mut closed_trades = Vec::new();
+        let mut next_position_id = 1;
 
-        let _ = std::fs::remove_file(path);
+        apply_trade_action(
+            TradeAction::OpenLong,
+            &mut open_trades,
+            &mut closed_trades,
+            &mut next_position_id,
+            event(0, 100.0, None),
+            1.0,
+        )
+        .expect("open position");
+
+        let err = apply_trade_action(
+            TradeAction::Close,
+            &mut open_trades,
+            &mut closed_trades,
+            &mut next_position_id,
+            event(1, 101.0, None),
+            1.0,
+        )
+        .expect_err("close without id must fail");
+
+        assert!(err.to_string().contains("position_id"));
+        assert_eq!(open_trades.len(), 1);
+        assert!(closed_trades.is_empty());
     }
 
     #[test]

@@ -23,10 +23,8 @@ struct MarketLabConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MarketConfig {
-    #[serde(rename = "provider")]
-    _provider: Option<String>,
-    #[serde(rename = "exchange")]
-    _exchange: Option<String>,
+    provider: Option<String>,
+    exchange: Option<String>,
     symbol: Option<String>,
 }
 
@@ -41,7 +39,7 @@ struct OutputConfig {
 #[serde(deny_unknown_fields)]
 struct ScriptConfig {
     path: Option<PathBuf>,
-    params: Option<BTreeMap<String, toml::Value>>,
+    params: Option<BTreeMap<String, BTreeMap<String, toml::Value>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,15 +146,13 @@ fn append_script_config_flags(
     mode: &str,
 ) -> Result<()> {
     if let Some(market) = &config.market {
+        append_optional(args, "--provider", market.provider.as_deref());
+        append_optional(args, "--exchange", market.exchange.as_deref());
         append_optional(args, "--symbol", market.symbol.as_deref());
     }
 
     if let Some(sources) = &config.sources {
         for (source, values) in sources {
-            if values.is_empty() {
-                append_pair(args, "--source", source);
-                continue;
-            }
             for (name, value) in values {
                 append_pair(
                     args,
@@ -172,8 +168,14 @@ fn append_script_config_flags(
         .as_ref()
         .and_then(|script| script.params.as_ref())
     {
-        for (name, value) in params {
-            append_pair(args, "--param", &format!("{name}={}", scalar(value)?));
+        for (source, values) in params {
+            for (name, value) in values {
+                append_pair(
+                    args,
+                    "--param",
+                    &format!("{source}:{name}={}", scalar(value)?),
+                );
+            }
         }
     }
 
@@ -300,6 +302,8 @@ fn config_command(args: &[OsString]) -> Option<ConfigCommand<'_>> {
 fn has_script_positional(args: &[OsString], start: usize) -> bool {
     let value_flags = [
         "--config",
+        "--provider",
+        "--exchange",
         "--symbol",
         "--venue",
         "--from",
@@ -403,10 +407,8 @@ mod tests {
     use clap::Parser;
 
     use crate::cli::{Cli, Commands, ScriptCommands};
-    use crate::scripting::inputs::{
-        parse_param_values, parse_source_configs, resolve_params, validate_source_configs_for_run,
-    };
-    use crate::scripting::manifest::{InputType, ScriptManifest, ScriptParamSchema, ScriptSource};
+    use crate::scripting::inputs::{parse_source_configs, validate_source_configs};
+    use crate::scripting::manifest::{ScriptManifest, ScriptSource};
 
     #[test]
     fn cli_values_override_config_values() {
@@ -426,10 +428,10 @@ symbol = "HYPE/USDT"
 [script]
 path = "strategy.js"
 
-[sources."candles@bybitf@mmt"]
+[sources.candles]
 timeframe = 60
 
-[script.params]
+[script.params.candles]
 fast = 20
 
 [backtest]
@@ -463,9 +465,10 @@ leverage = 2
                 command: ScriptCommands::Backtest(args),
             } => {
                 assert_eq!(args.symbol, "BTC/USDT");
+                assert_eq!(args.exchange.as_deref(), Some("bybitf"));
                 assert_eq!(args.leverage, 5.0);
-                assert_eq!(args.source, vec!["candles@bybitf@mmt:timeframe=60"]);
-                assert_eq!(args.param, vec!["fast=20"]);
+                assert_eq!(args.source, vec!["candles:timeframe=60"]);
+                assert_eq!(args.param, vec!["candles:fast=20"]);
                 assert!(args.script.ends_with("strategy.js"));
             }
             _ => panic!("expected script backtest"),
@@ -473,7 +476,7 @@ leverage = 2
     }
 
     #[test]
-    fn expands_mixed_provider_script_sources() {
+    fn expands_exchange_qualified_script_sources_without_global_exchange() {
         let dir =
             std::env::temp_dir().join(format!("mlab-multi-exchange-config-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("create config test directory");
@@ -484,19 +487,22 @@ leverage = 2
 version = 1
 
 [market]
+provider = "mmt"
 symbol = "BTC/USDT"
 
 [script]
 path = "strategy.js"
 
-[sources."candles@okx@mmt"]
+[sources."candles@okx"]
 timeframe = 60
 
-[sources."orderbook@bulk"]
+[sources."orderbook@binancef"]
 depth = 20
+timeframe = 60
 
-[script.params]
-max_spread = 1
+[backtest]
+from = 1780000000000
+to = 1780003600000
 "#,
         )
         .expect("write config");
@@ -505,7 +511,7 @@ max_spread = 1
             [
                 "mlab",
                 "script",
-                "run",
+                "backtest",
                 "--config",
                 path.to_str().expect("utf8 path"),
             ]
@@ -517,15 +523,22 @@ max_spread = 1
 
         match cli.command {
             Commands::Script {
-                command: ScriptCommands::Run(args),
+                command: ScriptCommands::Backtest(args),
             } => {
-                assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
+                assert_eq!(args.exchange, None);
+                assert_eq!(args.symbol, "BTC/USDT");
                 assert_eq!(
                     args.source,
-                    vec!["candles@okx@mmt:timeframe=60", "orderbook@bulk:depth=20",]
+                    vec![
+                        "candles@okx:timeframe=60",
+                        "orderbook@binancef:depth=20",
+                        "orderbook@binancef:timeframe=60"
+                    ]
                 );
-                assert_eq!(args.param, vec!["max_spread=1"]);
-                args.validate().expect("qualified bindings should validate");
+                args.validate()
+                    .expect("qualified sources should not require --exchange");
+                let configs = parse_source_configs(&args.source, None)
+                    .expect("parse qualified sources from TOML");
                 let manifest = ScriptManifest {
                     name: "toml-multi-exchange".to_string(),
                     version: "1".to_string(),
@@ -534,26 +547,12 @@ max_spread = 1
                     clock: None,
                     description: None,
                     lookback: None,
-                    params: BTreeMap::from([(
-                        "max_spread".to_string(),
-                        ScriptParamSchema {
-                            input_type: InputType::Number,
-                            required: true,
-                            default: None,
-                            description: None,
-                        },
-                    )]),
+                    params: BTreeMap::new(),
                 };
-                let configs =
-                    parse_source_configs(&args.source).expect("parse qualified bindings from TOML");
-                validate_source_configs_for_run(&manifest, &configs)
+                validate_source_configs(&manifest, &configs)
                     .expect("qualified TOML sources should fully validate");
-                let raw_params = parse_param_values(&args.param).expect("parse flat TOML params");
-                let params = resolve_params(&manifest, &raw_params)
-                    .expect("flat TOML params should fully validate");
-                assert_eq!(params["max_spread"], 1.0);
             }
-            _ => panic!("expected script run"),
+            _ => panic!("expected script backtest"),
         }
     }
 
