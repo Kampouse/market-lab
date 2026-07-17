@@ -326,17 +326,18 @@ impl From<TradeTimeInForce> for TimeInForce {
 
 #[derive(Clone, Debug, Args)]
 pub struct MarketsArgs {
-    #[arg(long, value_enum, default_value_t = MarketCatalogProvider::Bulk)]
-    pub provider: MarketCatalogProvider,
+    #[arg(long)]
+    pub exchange: String,
     #[arg(long)]
     pub symbol: Option<String>,
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum MarketCatalogProvider {
-    Bulk,
+impl MarketsArgs {
+    pub fn validate(&self) -> Result<()> {
+        validate_bulk_exchange(&self.exchange, "markets")
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -427,10 +428,6 @@ pub struct ScriptRunArgs {
     pub script: String,
     #[arg(long)]
     pub config: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
-    pub provider: CliProviderKind,
-    #[arg(long)]
-    pub exchange: Option<String>,
     #[arg(long)]
     pub symbol: Option<String>,
     /// Arms live execution for ctx.trade/ctx.cancel while data may come from any provider.
@@ -444,6 +441,9 @@ pub struct ScriptRunArgs {
     pub source: Vec<String>,
     #[arg(long = "param")]
     pub param: Vec<String>,
+    /// Maximum live runtime in seconds. Omit to run until manually stopped.
+    #[arg(long)]
+    pub duration: Option<u64>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
     #[arg(long, default_value_t = false)]
@@ -520,11 +520,10 @@ impl ScriptRunArgs {
         {
             bail!("--from must be less than --to");
         }
+        if self.duration == Some(0) {
+            bail!("--duration must be at least 1 second");
+        }
         Ok(())
-    }
-
-    pub fn exchange_name(&self) -> Result<&str> {
-        source_exchange(self.provider, self.exchange.as_deref())
     }
 }
 
@@ -533,10 +532,6 @@ pub struct ScriptBacktestArgs {
     pub script: String,
     #[arg(long)]
     pub config: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
-    pub provider: CliProviderKind,
-    #[arg(long)]
-    pub exchange: Option<String>,
     #[arg(long)]
     pub symbol: String,
     #[arg(long)]
@@ -560,11 +555,6 @@ impl ScriptBacktestArgs {
         if self.script.trim().is_empty() {
             bail!("script path is required");
         }
-        if matches!(self.provider, CliProviderKind::Bulk) {
-            source_exchange(self.provider, self.exchange.as_deref())?;
-        } else if self.exchange.as_deref().is_some_and(str::is_empty) {
-            bail!("--exchange cannot be empty");
-        }
         if !is_valid_symbol(&self.symbol) {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
@@ -577,10 +567,6 @@ impl ScriptBacktestArgs {
             bail!("--leverage must be > 0");
         }
         Ok(())
-    }
-
-    pub fn exchange_name(&self) -> Result<&str> {
-        source_exchange(self.provider, self.exchange.as_deref())
     }
 }
 
@@ -621,10 +607,10 @@ impl ScriptRunsShowArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct SourceVdArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
-    pub provider: CliProviderKind,
-    #[arg(long, required_if_eq("provider", "mmt"))]
-    pub exchange: Option<String>,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
+    #[arg(long)]
+    pub exchange: String,
     #[arg(long)]
     pub symbol: String,
     #[arg(long)]
@@ -647,8 +633,8 @@ pub struct SourceVdArgs {
 
 impl SourceVdArgs {
     pub fn validate(&self) -> Result<()> {
-        validate_source_identity(self.provider, self.exchange.as_deref(), &self.symbol)?;
-        if matches!(self.provider, CliProviderKind::Bulk) {
+        let provider = validate_source_identity(self.provider, &self.exchange, &self.symbol)?;
+        if provider == CliProviderKind::Bulk {
             if !self.stream {
                 bail!("BULK volume delta is derived from live trades and requires --stream");
             }
@@ -699,14 +685,18 @@ impl SourceVdArgs {
     }
 
     pub fn exchange_name(&self) -> Result<&str> {
-        source_exchange(self.provider, self.exchange.as_deref())
+        Ok(&self.exchange)
+    }
+
+    pub fn provider_kind(&self) -> Result<CliProviderKind> {
+        resolve_source_provider(self.provider, &self.exchange)
     }
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct CvdArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum, default_value_t = CliDataProvider::Mmt)]
+    pub provider: CliDataProvider,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
@@ -733,10 +723,10 @@ pub struct CvdArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct SourceCandlesArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
-    pub provider: CliProviderKind,
-    #[arg(long, required_if_eq("provider", "mmt"))]
-    pub exchange: Option<String>,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
+    #[arg(long)]
+    pub exchange: String,
     #[arg(long)]
     pub symbol: String,
     #[arg(long)]
@@ -758,8 +748,8 @@ pub struct SourceCandlesArgs {
 impl SourceCandlesArgs {
     pub fn validate(&self) -> Result<()> {
         TimeframeSourceValidation {
-            provider: self.provider,
-            exchange: self.exchange.as_deref(),
+            provider: self.provider_kind()?,
+            exchange: &self.exchange,
             symbol: &self.symbol,
             timeframe: self.timeframe,
             from: self.from,
@@ -772,20 +762,24 @@ impl SourceCandlesArgs {
     }
 
     pub fn timeframe_name(&self) -> Result<&'static str> {
-        provider_timeframe_from_seconds(self.provider, self.timeframe)
+        provider_timeframe_from_seconds(self.provider_kind()?, self.timeframe)
     }
 
     pub fn exchange_name(&self) -> Result<&str> {
-        source_exchange(self.provider, self.exchange.as_deref())
+        Ok(&self.exchange)
+    }
+
+    pub fn provider_kind(&self) -> Result<CliProviderKind> {
+        resolve_source_provider(self.provider, &self.exchange)
     }
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct SourceOiArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
-    pub provider: CliProviderKind,
-    #[arg(long, required_if_eq("provider", "mmt"))]
-    pub exchange: Option<String>,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
+    #[arg(long)]
+    pub exchange: String,
     #[arg(long)]
     pub symbol: String,
     #[arg(long)]
@@ -806,8 +800,8 @@ pub struct SourceOiArgs {
 
 impl SourceOiArgs {
     pub fn validate(&self) -> Result<()> {
-        validate_source_identity(self.provider, self.exchange.as_deref(), &self.symbol)?;
-        if matches!(self.provider, CliProviderKind::Bulk) {
+        let provider = validate_source_identity(self.provider, &self.exchange, &self.symbol)?;
+        if provider == CliProviderKind::Bulk {
             if self.timeframe.is_some() || self.from.is_some() || self.to.is_some() {
                 bail!("BULK open interest is current/live only; omit --timeframe/--from/--to");
             }
@@ -816,8 +810,8 @@ impl SourceOiArgs {
                 .timeframe
                 .ok_or_else(|| anyhow::anyhow!("--timeframe is required for MMT open interest"))?;
             TimeframeSourceValidation {
-                provider: self.provider,
-                exchange: self.exchange.as_deref(),
+                provider,
+                exchange: &self.exchange,
                 symbol: &self.symbol,
                 timeframe,
                 from: self.from,
@@ -839,16 +833,20 @@ impl SourceOiArgs {
     }
 
     pub fn exchange_name(&self) -> Result<&str> {
-        source_exchange(self.provider, self.exchange.as_deref())
+        Ok(&self.exchange)
+    }
+
+    pub fn provider_kind(&self) -> Result<CliProviderKind> {
+        resolve_source_provider(self.provider, &self.exchange)
     }
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct SourceVolumesArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
-    pub provider: CliProviderKind,
-    #[arg(long, required_if_eq("provider", "mmt"))]
-    pub exchange: Option<String>,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
+    #[arg(long)]
+    pub exchange: String,
     #[arg(long)]
     pub symbol: String,
     #[arg(long)]
@@ -870,8 +868,8 @@ pub struct SourceVolumesArgs {
 impl SourceVolumesArgs {
     pub fn validate(&self) -> Result<()> {
         TimeframeSourceValidation {
-            provider: self.provider,
-            exchange: self.exchange.as_deref(),
+            provider: self.provider_kind()?,
+            exchange: &self.exchange,
             symbol: &self.symbol,
             timeframe: self.timeframe,
             from: self.from,
@@ -884,17 +882,21 @@ impl SourceVolumesArgs {
     }
 
     pub fn timeframe_name(&self) -> Result<&'static str> {
-        provider_timeframe_from_seconds(self.provider, self.timeframe)
+        provider_timeframe_from_seconds(self.provider_kind()?, self.timeframe)
     }
 
     pub fn exchange_name(&self) -> Result<&str> {
-        source_exchange(self.provider, self.exchange.as_deref())
+        Ok(&self.exchange)
+    }
+
+    pub fn provider_kind(&self) -> Result<CliProviderKind> {
+        resolve_source_provider(self.provider, &self.exchange)
     }
 }
 
 struct TimeframeSourceValidation<'a> {
     provider: CliProviderKind,
-    exchange: Option<&'a str>,
+    exchange: &'a str,
     symbol: &'a str,
     timeframe: u32,
     from: Option<u64>,
@@ -906,7 +908,12 @@ struct TimeframeSourceValidation<'a> {
 
 impl TimeframeSourceValidation<'_> {
     fn validate(&self) -> Result<()> {
-        validate_source_identity(self.provider, self.exchange, self.symbol)?;
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        if !is_valid_symbol(self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
         provider_timeframe_from_seconds(self.provider, self.timeframe)?;
         if self.stream {
             if self.from.is_some() || self.to.is_some() {
@@ -974,10 +981,10 @@ impl CvdArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct SourceOrderbookArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
-    pub provider: CliProviderKind,
-    #[arg(long, required_if_eq("provider", "mmt"))]
-    pub exchange: Option<String>,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
+    #[arg(long)]
+    pub exchange: String,
     #[arg(long)]
     pub symbol: String,
     #[arg(long, default_value_t = 100)]
@@ -1000,7 +1007,7 @@ pub struct SourceOrderbookArgs {
 
 impl SourceOrderbookArgs {
     pub fn validate(&self) -> Result<()> {
-        validate_source_identity(self.provider, self.exchange.as_deref(), &self.symbol)?;
+        validate_source_identity(self.provider, &self.exchange, &self.symbol)?;
         if self.depth == 0 {
             bail!("--depth must be >= 1");
         }
@@ -1024,14 +1031,18 @@ impl SourceOrderbookArgs {
     }
 
     pub fn exchange_name(&self) -> Result<&str> {
-        source_exchange(self.provider, self.exchange.as_deref())
+        Ok(&self.exchange)
+    }
+
+    pub fn provider_kind(&self) -> Result<CliProviderKind> {
+        resolve_source_provider(self.provider, &self.exchange)
     }
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct SourceStatsArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Bulk)]
-    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
     #[arg(long)]
     pub symbol: Option<String>,
     #[arg(long, default_value = "1d")]
@@ -1048,9 +1059,7 @@ pub struct SourceStatsArgs {
 
 impl SourceStatsArgs {
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.provider, CliProviderKind::Bulk) {
-            bail!("source stats currently supports only --provider bulk");
-        }
+        validate_bulk_exchange(&self.exchange, "source stats")?;
         if let Some(symbol) = &self.symbol
             && !is_valid_symbol(symbol)
         {
@@ -1074,8 +1083,8 @@ impl SourceStatsArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct SourceFundingArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Bulk)]
-    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
     #[arg(long)]
     pub symbol: String,
     #[arg(long, default_value_t = false)]
@@ -1090,9 +1099,7 @@ pub struct SourceFundingArgs {
 
 impl SourceFundingArgs {
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.provider, CliProviderKind::Bulk) {
-            bail!("source funding currently supports only --provider bulk");
-        }
+        validate_bulk_exchange(&self.exchange, "source funding")?;
         if !is_valid_symbol(&self.symbol) {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
@@ -1105,18 +1112,34 @@ impl SourceFundingArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct HealthArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
+    #[arg(long)]
+    pub exchange: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct StatusArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
+    #[arg(long)]
+    pub exchange: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
+}
+
+impl HealthArgs {
+    pub fn provider_kind(&self) -> Result<ProviderKind> {
+        resolve_system_provider(self.provider, self.exchange.as_deref())
+    }
+}
+
+impl StatusArgs {
+    pub fn provider_kind(&self) -> Result<ProviderKind> {
+        resolve_system_provider(self.provider, self.exchange.as_deref())
+    }
 }
 
 #[derive(Clone, Debug, Args)]
@@ -1129,8 +1152,8 @@ pub struct UpgradeArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct InspectArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
@@ -1147,6 +1170,7 @@ pub struct InspectArgs {
 
 impl InspectArgs {
     pub fn validate(&self) -> Result<()> {
+        resolve_market_provider(self.provider, &self.exchange)?;
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
@@ -1162,7 +1186,8 @@ impl InspectArgs {
 
     pub fn to_request(&self) -> InspectRequest {
         InspectRequest {
-            provider: self.provider.into(),
+            provider: resolve_market_provider(self.provider, &self.exchange)
+                .expect("validated market provider"),
             exchange: self.exchange.clone(),
             symbol: self.symbol.clone(),
             at: self.at,
@@ -1174,8 +1199,8 @@ impl InspectArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct ReplayArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
@@ -1192,6 +1217,7 @@ pub struct ReplayArgs {
 
 impl ReplayArgs {
     pub fn validate(&self) -> Result<()> {
+        resolve_market_provider(self.provider, &self.exchange)?;
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
@@ -1211,7 +1237,8 @@ impl ReplayArgs {
 
     pub fn to_request(&self) -> ReplayRequest {
         ReplayRequest {
-            provider: self.provider.into(),
+            provider: resolve_market_provider(self.provider, &self.exchange)
+                .expect("validated market provider"),
             exchange: self.exchange.clone(),
             symbol: self.symbol.clone(),
             from: self.from,
@@ -1223,8 +1250,8 @@ impl ReplayArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct SlippageArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
@@ -1249,6 +1276,7 @@ pub struct SlippageArgs {
 
 impl SlippageArgs {
     pub fn validate(&self) -> Result<()> {
+        resolve_market_provider(self.provider, &self.exchange)?;
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
@@ -1269,7 +1297,8 @@ impl SlippageArgs {
 
     pub fn to_request(&self) -> SlippageRequest {
         SlippageRequest {
-            provider: self.provider.into(),
+            provider: resolve_market_provider(self.provider, &self.exchange)
+                .expect("validated market provider"),
             exchange: self.exchange.clone(),
             symbol: self.symbol.clone(),
             side: self.side.into(),
@@ -1284,8 +1313,8 @@ impl SlippageArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct ImbalanceArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
@@ -1306,6 +1335,7 @@ pub struct ImbalanceArgs {
 
 impl ImbalanceArgs {
     pub fn validate(&self) -> Result<()> {
+        resolve_market_provider(self.provider, &self.exchange)?;
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
@@ -1323,7 +1353,8 @@ impl ImbalanceArgs {
 
     pub fn to_request(&self) -> ImbalanceRequest {
         ImbalanceRequest {
-            provider: self.provider.into(),
+            provider: resolve_market_provider(self.provider, &self.exchange)
+                .expect("validated market provider"),
             exchange: self.exchange.clone(),
             symbol: self.symbol.clone(),
             depth: self.depth,
@@ -1336,8 +1367,8 @@ impl ImbalanceArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct VampArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
@@ -1360,8 +1391,8 @@ pub struct VampArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct SpreadArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
@@ -1382,6 +1413,7 @@ pub struct SpreadArgs {
 
 impl SpreadArgs {
     pub fn validate(&self) -> Result<()> {
+        resolve_market_provider(self.provider, &self.exchange)?;
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
@@ -1399,7 +1431,8 @@ impl SpreadArgs {
 
     pub fn to_request(&self) -> SpreadRequest {
         SpreadRequest {
-            provider: self.provider.into(),
+            provider: resolve_market_provider(self.provider, &self.exchange)
+                .expect("validated market provider"),
             exchange: self.exchange.clone(),
             symbol: self.symbol.clone(),
             depth: self.depth,
@@ -1412,8 +1445,8 @@ impl SpreadArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct DepthArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
@@ -1434,8 +1467,8 @@ pub struct DepthArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct RunSmaCrossoverArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum, default_value_t = CliDataProvider::Mmt)]
+    pub provider: CliDataProvider,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
@@ -1488,8 +1521,8 @@ impl RunSmaCrossoverArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct BacktestSmaCrossoverArgs {
-    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
-    pub provider: CliProviderKind,
+    #[arg(long, value_enum, default_value_t = CliDataProvider::Mmt)]
+    pub provider: CliDataProvider,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
@@ -1541,6 +1574,7 @@ impl BacktestSmaCrossoverArgs {
 
 impl DepthArgs {
     pub fn validate(&self) -> Result<()> {
+        resolve_market_provider(self.provider, &self.exchange)?;
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
@@ -1558,7 +1592,8 @@ impl DepthArgs {
 
     pub fn to_request(&self) -> DepthRequest {
         DepthRequest {
-            provider: self.provider.into(),
+            provider: resolve_market_provider(self.provider, &self.exchange)
+                .expect("validated market provider"),
             exchange: self.exchange.clone(),
             symbol: self.symbol.clone(),
             levels: self.levels,
@@ -1571,6 +1606,7 @@ impl DepthArgs {
 
 impl VampArgs {
     pub fn validate(&self) -> Result<()> {
+        resolve_market_provider(self.provider, &self.exchange)?;
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
@@ -1591,7 +1627,8 @@ impl VampArgs {
 
     pub fn to_request(&self) -> VampRequest {
         VampRequest {
-            provider: self.provider.into(),
+            provider: resolve_market_provider(self.provider, &self.exchange)
+                .expect("validated market provider"),
             exchange: self.exchange.clone(),
             symbol: self.symbol.clone(),
             depth: self.depth,
@@ -1612,32 +1649,65 @@ fn is_valid_symbol(symbol: &str) -> bool {
 }
 
 fn validate_source_identity(
-    provider: CliProviderKind,
-    exchange: Option<&str>,
+    provider: Option<CliDataProvider>,
+    exchange: &str,
     symbol: &str,
-) -> Result<()> {
-    source_exchange(provider, exchange)?;
+) -> Result<CliProviderKind> {
+    let provider = resolve_source_provider(provider, exchange)?;
     if !is_valid_symbol(symbol) {
         bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
     }
-    Ok(())
+    Ok(provider)
 }
 
-fn source_exchange(provider: CliProviderKind, exchange: Option<&str>) -> Result<&str> {
-    if matches!(provider, CliProviderKind::Bulk) {
-        if let Some(exchange) = exchange
-            && !exchange.eq_ignore_ascii_case("bulk")
-        {
-            bail!("--exchange must be omitted or set to `bulk` with --provider bulk");
-        }
-        return Ok("bulk");
-    }
-
-    let exchange = exchange.context("--exchange is required for this provider")?;
+fn resolve_source_provider(
+    provider: Option<CliDataProvider>,
+    exchange: &str,
+) -> Result<CliProviderKind> {
     if exchange.trim().is_empty() {
         bail!("--exchange cannot be empty");
     }
-    Ok(exchange)
+    if provider.is_some() {
+        if exchange.eq_ignore_ascii_case("bulk") {
+            bail!("omit --provider for the standalone `bulk` exchange");
+        }
+        return Ok(CliProviderKind::Mmt);
+    }
+    if exchange.eq_ignore_ascii_case("bulk") {
+        return Ok(CliProviderKind::Bulk);
+    }
+    bail!(
+        "standalone exchange `{exchange}` is not supported yet; use --provider mmt when `{exchange}` is routed through MMT"
+    )
+}
+
+fn resolve_market_provider(
+    provider: Option<CliDataProvider>,
+    exchange: &str,
+) -> Result<ProviderKind> {
+    resolve_source_provider(provider, exchange).map(Into::into)
+}
+
+fn resolve_system_provider(
+    provider: Option<CliDataProvider>,
+    exchange: Option<&str>,
+) -> Result<ProviderKind> {
+    match (provider, exchange) {
+        (Some(_), Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => {
+            bail!("omit --provider for the standalone `bulk` exchange")
+        }
+        (Some(_), _) => Ok(ProviderKind::Mmt),
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => Ok(ProviderKind::Bulk),
+        (None, Some(exchange)) => bail!("unsupported standalone exchange `{exchange}`"),
+        (None, None) => Ok(ProviderKind::MarketLab),
+    }
+}
+
+fn validate_bulk_exchange(exchange: &str, command: &str) -> Result<()> {
+    if !exchange.eq_ignore_ascii_case("bulk") {
+        bail!("{command} currently supports only --exchange bulk");
+    }
+    Ok(())
 }
 
 fn provider_timeframe_from_seconds(
@@ -1685,11 +1755,24 @@ pub(crate) fn mmt_timeframe_from_seconds(seconds: u32) -> Result<&'static str> {
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CliDataProvider {
+    Mmt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CliProviderKind {
     MarketLab,
     Mmt,
     Bulk,
+}
+
+impl From<CliDataProvider> for CliProviderKind {
+    fn from(value: CliDataProvider) -> Self {
+        match value {
+            CliDataProvider::Mmt => Self::Mmt,
+        }
+    }
 }
 
 impl From<CliProviderKind> for ProviderKind {
@@ -1751,7 +1834,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "mlab",
             "markets",
-            "--provider",
+            "--exchange",
             "bulk",
             "--symbol",
             "BTC/USDT",
@@ -1761,9 +1844,10 @@ mod tests {
 
         match cli.command {
             Commands::Markets(args) => {
-                assert!(matches!(args.provider, MarketCatalogProvider::Bulk));
+                assert_eq!(args.exchange, "bulk");
                 assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
                 assert!(args.json);
+                args.validate().expect("BULK markets should validate");
             }
             _ => panic!("expected markets command"),
         }
@@ -1939,8 +2023,6 @@ mod tests {
             "market-lab",
             "source",
             "vd",
-            "--provider",
-            "mmt",
             "--exchange",
             "binancef",
             "--symbol",
@@ -1977,8 +2059,6 @@ mod tests {
             "market-lab",
             "study",
             "cvd",
-            "--provider",
-            "mmt",
             "--exchange",
             "binancef",
             "--symbol",
@@ -2193,7 +2273,9 @@ mod tests {
         let cli = Cli::try_parse_from(["market-lab", "health", "--provider", "mmt"])
             .expect("health parse should succeed");
         match cli.command {
-            Commands::Health(args) => assert!(matches!(args.provider, CliProviderKind::Mmt)),
+            Commands::Health(args) => {
+                assert!(matches!(args.provider, Some(CliDataProvider::Mmt)))
+            }
             _ => panic!("expected health command"),
         }
     }
@@ -2203,7 +2285,9 @@ mod tests {
         let cli = Cli::try_parse_from(["market-lab", "status", "--provider", "mmt"])
             .expect("status parse should succeed");
         match cli.command {
-            Commands::Status(args) => assert!(matches!(args.provider, CliProviderKind::Mmt)),
+            Commands::Status(args) => {
+                assert!(matches!(args.provider, Some(CliDataProvider::Mmt)))
+            }
             _ => panic!("expected status command"),
         }
     }
@@ -2244,7 +2328,7 @@ mod tests {
             Commands::Study {
                 command: StudyCommands::Imbalance(args),
             } => {
-                assert!(matches!(args.provider, CliProviderKind::Mmt));
+                assert!(matches!(args.provider, Some(CliDataProvider::Mmt)));
                 assert_eq!(args.depth, 25);
                 assert!(args.stream);
             }
@@ -2275,7 +2359,7 @@ mod tests {
             Commands::Study {
                 command: StudyCommands::Vamp(args),
             } => {
-                assert!(matches!(args.provider, CliProviderKind::Mmt));
+                assert!(matches!(args.provider, Some(CliDataProvider::Mmt)));
                 assert_eq!(args.depth, 100);
                 assert_eq!(args.dollar_depth, 50000.0);
             }
@@ -2311,7 +2395,7 @@ mod tests {
             Commands::Source {
                 command: SourceCommands::Orderbook(args),
             } => {
-                assert!(matches!(args.provider, CliProviderKind::Mmt));
+                assert!(matches!(args.provider, Some(CliDataProvider::Mmt)));
                 assert!(args.stream);
                 assert_eq!(args.interval_ms, 500);
             }
@@ -2320,12 +2404,12 @@ mod tests {
     }
 
     #[test]
-    fn bulk_market_data_sources_do_not_require_exchange_or_mmt_auth() {
+    fn bulk_market_data_sources_use_exchange_without_mmt_auth() {
         let candles = Cli::try_parse_from([
             "mlab",
             "source",
             "candles",
-            "--provider",
+            "--exchange",
             "bulk",
             "--symbol",
             "BTC/USDT",
@@ -2341,7 +2425,12 @@ mod tests {
             Commands::Source {
                 command: SourceCommands::Candles(args),
             } => {
-                assert!(args.exchange.is_none());
+                assert_eq!(args.exchange, "bulk");
+                assert!(args.provider.is_none());
+                assert_eq!(
+                    args.provider_kind().expect("BULK provider should resolve"),
+                    CliProviderKind::Bulk
+                );
                 args.validate().expect("standalone BULK candles validate");
             }
             _ => panic!("expected BULK candles command"),
@@ -2351,7 +2440,7 @@ mod tests {
             "mlab",
             "source",
             "stats",
-            "--provider",
+            "--exchange",
             "bulk",
             "--symbol",
             "BTC/USDT",
@@ -2368,7 +2457,7 @@ mod tests {
             "mlab",
             "source",
             "funding",
-            "--provider",
+            "--exchange",
             "bulk",
             "--symbol",
             "BTC/USDT",
@@ -2383,12 +2472,109 @@ mod tests {
     }
 
     #[test]
+    fn mmt_is_the_only_public_provider_value() {
+        let error = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "orderbook",
+            "--provider",
+            "bulk",
+            "--exchange",
+            "bulk",
+            "--symbol",
+            "BTC/USDT",
+        ])
+        .expect_err("BULK must not be accepted as a provider");
+
+        let message = error.to_string();
+        assert!(message.contains("invalid value 'bulk'"));
+        assert!(message.contains("mmt"));
+    }
+
+    #[test]
+    fn mmt_routes_an_exchange_while_bulk_is_standalone() {
+        let mmt = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "orderbook",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+        ])
+        .expect("MMT source should parse");
+        match mmt.command {
+            Commands::Source {
+                command: SourceCommands::Orderbook(args),
+            } => {
+                args.validate().expect("MMT source should validate");
+                assert_eq!(
+                    args.provider_kind().expect("MMT provider should resolve"),
+                    CliProviderKind::Mmt
+                );
+            }
+            _ => panic!("expected MMT orderbook command"),
+        }
+
+        let invalid = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "orderbook",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "bulk",
+            "--symbol",
+            "BTC/USDT",
+        ])
+        .expect("syntax should parse before provider validation");
+        match invalid.command {
+            Commands::Source {
+                command: SourceCommands::Orderbook(args),
+            } => {
+                let error = args
+                    .validate()
+                    .expect_err("BULK must not be routed through MMT");
+                assert!(error.to_string().contains("omit --provider"));
+            }
+            _ => panic!("expected invalid BULK orderbook command"),
+        }
+    }
+
+    #[test]
+    fn unsupported_standalone_exchange_explains_mmt_routing() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "orderbook",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+        ])
+        .expect("syntax should parse before exchange validation");
+        match cli.command {
+            Commands::Source {
+                command: SourceCommands::Orderbook(args),
+            } => {
+                let error = args
+                    .validate()
+                    .expect_err("binancef is not a standalone exchange yet");
+                assert!(error.to_string().contains("--provider mmt"));
+            }
+            _ => panic!("expected standalone orderbook command"),
+        }
+    }
+
+    #[test]
     fn rejects_seconds_at_the_market_lab_boundary() {
         let cli = Cli::try_parse_from([
             "mlab",
             "source",
             "candles",
-            "--provider",
+            "--exchange",
             "bulk",
             "--symbol",
             "BTC/USDT",
@@ -2514,16 +2700,14 @@ mod tests {
             "script",
             "run",
             "./studies/buy-pressure.js",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "bybitf",
             "--symbol",
             "BTC/USDT",
             "--source",
-            "candles:timeframe=60",
+            "candles@bybitf@mmt:timeframe=60",
             "--param",
-            "candles:min_vbuy=50000",
+            "min_vbuy=50000",
+            "--duration",
+            "3600",
             "--output",
             "json",
         ])
@@ -2534,10 +2718,10 @@ mod tests {
                 command: ScriptCommands::Run(args),
             } => {
                 assert_eq!(args.script, "./studies/buy-pressure.js");
-                assert_eq!(args.exchange.as_deref(), Some("bybitf"));
                 assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
-                assert_eq!(args.source, vec!["candles:timeframe=60"]);
-                assert_eq!(args.param, vec!["candles:min_vbuy=50000"]);
+                assert_eq!(args.source, vec!["candles@bybitf@mmt:timeframe=60"]);
+                assert_eq!(args.param, vec!["min_vbuy=50000"]);
+                assert_eq!(args.duration, Some(3600));
                 args.validate().expect("validate should succeed");
             }
             _ => panic!("expected script run command"),
@@ -2554,11 +2738,34 @@ mod tests {
                 command: ScriptCommands::Run(args),
             } => {
                 assert_eq!(args.script, "test/buy-pressure.js");
-                assert!(args.exchange.is_none());
                 assert!(args.symbol.is_none());
                 assert!(args.from.is_none());
                 assert!(args.to.is_none());
+                assert!(args.duration.is_none());
                 args.validate().expect("base validate should succeed");
+            }
+            _ => panic!("expected script run command"),
+        }
+    }
+
+    #[test]
+    fn reject_zero_script_run_duration() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "run",
+            "test/market-maker.js",
+            "--duration",
+            "0",
+        ])
+        .expect("duration syntax should parse before validation");
+
+        match cli.command {
+            Commands::Script {
+                command: ScriptCommands::Run(args),
+            } => {
+                let error = args.validate().expect_err("zero duration must fail");
+                assert!(error.to_string().contains("at least 1 second"));
             }
             _ => panic!("expected script run command"),
         }
@@ -2571,10 +2778,6 @@ mod tests {
             "script",
             "backtest",
             "./scripts/sma-cross.js",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "bybitf",
             "--symbol",
             "BTC/USDT",
             "--from",
@@ -2582,9 +2785,9 @@ mod tests {
             "--to",
             "1704067800000",
             "--source",
-            "candles:timeframe=60",
+            "candles@bybitf@mmt:timeframe=60",
             "--param",
-            "candles:fast=20",
+            "fast=20",
             "--leverage",
             "5",
             "--output",
@@ -2597,8 +2800,8 @@ mod tests {
                 command: ScriptCommands::Backtest(args),
             } => {
                 assert_eq!(args.script, "./scripts/sma-cross.js");
-                assert_eq!(args.source, vec!["candles:timeframe=60"]);
-                assert_eq!(args.param, vec!["candles:fast=20"]);
+                assert_eq!(args.source, vec!["candles@bybitf@mmt:timeframe=60"]);
+                assert_eq!(args.param, vec!["fast=20"]);
                 assert_eq!(args.leverage, 5.0);
                 args.validate().expect("validate should succeed");
             }
@@ -2613,8 +2816,6 @@ mod tests {
             "script",
             "backtest",
             "./scripts/cross-exchange.js",
-            "--provider",
-            "mmt",
             "--symbol",
             "BTC/USDT",
             "--from",
@@ -2622,9 +2823,9 @@ mod tests {
             "--to",
             "1704067800000",
             "--source",
-            "candles@binancef:timeframe=60",
+            "candles@binancef@mmt:timeframe=60",
             "--source",
-            "candles@okx:timeframe=60",
+            "candles@okx@mmt:timeframe=60",
         ])
         .expect("qualified script sources should parse without --exchange");
 
@@ -2632,10 +2833,12 @@ mod tests {
             Commands::Script {
                 command: ScriptCommands::Backtest(args),
             } => {
-                assert!(args.exchange.is_none());
                 assert_eq!(
                     args.source,
-                    vec!["candles@binancef:timeframe=60", "candles@okx:timeframe=60"]
+                    vec![
+                        "candles@binancef@mmt:timeframe=60",
+                        "candles@okx@mmt:timeframe=60"
+                    ]
                 );
                 args.validate().expect("backtest should validate");
             }
@@ -2650,18 +2853,16 @@ mod tests {
             "script",
             "run",
             "./examples/candle-summary.js",
-            "--provider",
-            "bulk",
             "--symbol",
             "BTC/USDT",
             "--source",
-            "candles:timeframe=60",
+            "candles@bulk:timeframe=60",
         ])
         .expect("BULK script run should parse without exchange");
         match run.command {
             Commands::Script {
                 command: ScriptCommands::Run(args),
-            } => assert_eq!(args.exchange_name().unwrap(), "bulk"),
+            } => assert_eq!(args.source, vec!["candles@bulk:timeframe=60"]),
             _ => panic!("expected script run command"),
         }
 
@@ -2670,8 +2871,6 @@ mod tests {
             "script",
             "backtest",
             "./examples/sma-cross.js",
-            "--provider",
-            "bulk",
             "--symbol",
             "BTC/USDT",
             "--from",
@@ -2679,15 +2878,14 @@ mod tests {
             "--to",
             "1704067800000",
             "--source",
-            "candles:timeframe=60",
+            "candles@bulk:timeframe=60",
         ])
         .expect("BULK script backtest should parse without exchange");
         match backtest.command {
             Commands::Script {
                 command: ScriptCommands::Backtest(args),
             } => {
-                assert!(args.exchange.is_none());
-                assert_eq!(args.exchange_name().unwrap(), "bulk");
+                assert_eq!(args.source, vec!["candles@bulk:timeframe=60"]);
                 args.validate().expect("BULK backtest should validate");
             }
             _ => panic!("expected script backtest command"),
@@ -2756,8 +2954,6 @@ mod tests {
             "script",
             "run",
             "strategy.js",
-            "--provider",
-            "bulk",
             "--symbol",
             "BTC/USDT",
             "--venue",
