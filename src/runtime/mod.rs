@@ -15,7 +15,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 use crate::credentials;
-use crate::domain::execution::{CancelPlan, ExecutionReceipt, ExecutionVenue, Position, TradePlan};
+use crate::domain::execution::{
+    CancelPlan, ExecutionReceipt, ExecutionVenue, Position, PositionDirection, TradePlan,
+};
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::ws::BulkAccountStream;
 use crate::scripting::execution::{
@@ -550,6 +552,10 @@ pub async fn track_receipt(plan: &TradePlan, receipt: &ExecutionReceipt) -> Resu
 }
 
 pub async fn submit_trade(plan: &TradePlan) -> Result<ExecutionReceipt> {
+    // OpenFinance routes directly — no daemon needed
+    if plan.venue == ExecutionVenue::OpenFinance {
+        return submit_openfinance_trade(plan).await;
+    }
     ensure_running().await?;
     let response = request(RuntimeRequest::ExecuteTrade { plan: plan.clone() }).await?;
     if !response.ok {
@@ -561,6 +567,10 @@ pub async fn submit_trade(plan: &TradePlan) -> Result<ExecutionReceipt> {
 }
 
 pub async fn submit_cancel(plan: &CancelPlan) -> Result<ExecutionReceipt> {
+    // OpenFinance routes directly — no daemon needed
+    if plan.venue == ExecutionVenue::OpenFinance {
+        return submit_openfinance_cancel(plan).await;
+    }
     ensure_running().await?;
     let response = request(RuntimeRequest::CancelOrder { plan: plan.clone() }).await?;
     if !response.ok {
@@ -791,6 +801,72 @@ pub async fn script_worker_finished(
         bail!("mlabd rejected script worker finish: {}", response.message);
     }
     response.job.context("mlabd omitted the script worker job")
+}
+
+/// Execute a trade directly via OpenFinance/Hyperliquid (bypasses mlabd).
+async fn submit_openfinance_trade(plan: &TradePlan) -> Result<ExecutionReceipt> {
+    use crate::providers::openfinance::{self, OpenFinanceClient};
+
+    let client = OpenFinanceClient::new()?;
+    let coin = &plan.venue_symbol;
+    let (asset_idx, _) = openfinance::resolve_asset_index(&client, coin).await?;
+
+    let is_buy = plan.direction == PositionDirection::Long;
+    let tif = if matches!(plan.order_kind, crate::domain::execution::OrderKind::Market) {
+        "Ioc"
+    } else {
+        "Gtc"
+    };
+
+    let receipt = openfinance::place_order(
+        &client,
+        asset_idx,
+        is_buy,
+        plan.size,
+        plan.price.unwrap_or(plan.reference_price),
+        tif,
+        plan.reduce_only,
+    )
+    .await?;
+
+    // Place native SL if specified
+    if let Some(sl_price) = plan.stop_loss_price {
+        let sl_buy = !is_buy; // SL for a long is a sell
+        let _ = openfinance::place_trigger_order(
+            &client, asset_idx, sl_buy, plan.size, sl_price, true, "sl", true,
+        ).await;
+    }
+
+    // Place native TP if specified
+    if let Some(tp_price) = plan.take_profit_price {
+        let tp_buy = !is_buy;
+        let _ = openfinance::place_trigger_order(
+            &client, asset_idx, tp_buy, plan.size, tp_price, true, "tp", true,
+        ).await;
+    }
+
+    Ok(receipt)
+}
+
+/// Cancel an order directly via OpenFinance/Hyperliquid (bypasses mlabd).
+async fn submit_openfinance_cancel(plan: &CancelPlan) -> Result<ExecutionReceipt> {
+    use crate::providers::openfinance::{self, OpenFinanceClient};
+
+    let client = OpenFinanceClient::new()?;
+    let coin = plan.internal_symbol.split('/').next().unwrap_or(&plan.internal_symbol);
+    let (asset_idx, _) = openfinance::resolve_asset_index(&client, coin).await?;
+
+    let _ = openfinance::cancel_order(&client, asset_idx, &plan.order_id).await;
+
+    Ok(ExecutionReceipt {
+        venue: ExecutionVenue::OpenFinance,
+        account: "hyperliquid".to_string(),
+        order_id: Some(plan.order_id.clone()),
+        status: "cancelled".to_string(),
+        terminal: true,
+        submitted_at_ms: now_ms()?,
+        raw_status: serde_json::json!({"status": "cancelled"}),
+    })
 }
 
 pub async fn submit_script_trade(
