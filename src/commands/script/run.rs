@@ -382,7 +382,15 @@ async fn stream_sources(
             }
         };
         if args.paper {
-            paper_dispatch(&execution.commands, &paper_state, &market.symbol);
+            let mut ps = paper_state.lock().unwrap();
+            for cmd in &execution.commands {
+                match cmd {
+                    ScriptExecutionCommand::Trade { order, request } => {
+                        let _ = ps.process_trade(order, request);
+                    }
+                    ScriptExecutionCommand::Cancel { .. } => {}
+                }
+            }
         } else {
             dispatch_execution_commands(job_id, execution.commands).await?;
         }
@@ -1454,14 +1462,20 @@ async fn run_paper(args: ScriptRunArgs) -> Result<()> {
                 match cmd {
                     ScriptExecutionCommand::Trade { order, request } => {
                         let _ = ps.process_trade(order, request);
+                        // Stamp entry time with current candle
+                        if let Some(pos) = &mut ps.position {
+                            pos.entry_candle_t = candle.t;
+                        }
                     }
                     ScriptExecutionCommand::Cancel { .. } => {}
                 }
             }
 
             // Check intrabar exits using the candle high/low
-            ps.check_exits_intrabar(candle.h, candle.l);
-            ps.tick_bar();
+            let exited = ps.check_exits_intrabar(candle.h, candle.l);
+            if !exited {
+                ps.tick_bar();
+            }
         }
 
         hooks += 1;
@@ -1502,53 +1516,24 @@ async fn run_paper(args: ScriptRunArgs) -> Result<()> {
         let entry = pos["entry"].as_f64().unwrap_or(0.0);
         println!("Open position: {} @ ${:.4}", side, entry);
     }
+
+    // Print trade log
+    {
+        let state = paper_state.lock().unwrap();
+        if !state.trades.is_empty() {
+            println!("\n{}", "-".repeat(50));
+            println!("  #  Side    Entry       Exit        PnL%    Reason");
+            println!("{}", "-".repeat(50));
+            for (i, t) in state.trades.iter().enumerate() {
+                println!(
+                    "{:>3}  {:<6}  {:>9.4}  {:>9.4}  {:>+6.2}%  {}",
+                    i + 1, t.side, t.entry, t.exit, t.net_pnl_pct, t.reason
+                );
+            }
+            println!("{}", "-".repeat(50));
+        }
+    }
     println!();
 
     Ok(())
-}
-
-/// Process trade commands in paper mode (no exchange, no daemon).
-fn paper_dispatch(
-    commands: &[ScriptExecutionCommand],
-    state: &std::sync::Arc<std::sync::Mutex<PaperState>>,
-    _symbol: &str,
-) {
-    let mut state = state.lock().unwrap();
-    for command in commands {
-        match command {
-            ScriptExecutionCommand::Trade { order, request } => {
-                let _ = state.process_trade(order, request);
-            }
-            ScriptExecutionCommand::Cancel { .. } => {
-                // In paper mode, cancel just means close at market
-                // The strategy handles this via close-long/close-short in onData
-            }
-        }
-    }
-}
-
-/// Print final paper trading summary.
-fn print_paper_summary(state: &PaperState) {
-    let stats = state.stats();
-    let capital = stats["capital"].as_f64().unwrap_or(0.0);
-    let starting = stats["starting_capital"].as_f64().unwrap_or(100.0);
-    let trades = stats["trades"].as_u64().unwrap_or(0);
-    let wins = stats["wins"].as_u64().unwrap_or(0);
-    let wr = stats["win_rate"].as_f64().unwrap_or(0.0);
-    let pnl = capital - starting;
-
-    println!("\n📋 PAPER TRADING SUMMARY");
-    println!("{}", "=".repeat(50));
-    println!("Starting capital: ${:.2}", starting);
-    println!("Final capital:    ${:.2} ({:+.2} PnL)", capital, pnl);
-    println!("Trades: {} | Wins: {} | WR: {:.0}%", trades, wins, wr * 100.0);
-
-    if let Some(pos) = stats["open_position"].as_object() {
-        let side = pos["side"].as_str().unwrap_or("?");
-        let entry = pos["entry"].as_f64().unwrap_or(0.0);
-        let bars = pos["bars_held"].as_u64().unwrap_or(0);
-        println!("\nOpen: {} @ ${:.4} ({} bars)", side, entry, bars);
-    }
-
-    println!();
 }

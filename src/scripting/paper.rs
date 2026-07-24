@@ -31,6 +31,7 @@ pub struct PaperPosition {
     pub opened_at_ms: u64,
     pub bars_held: usize,
     pub order_key: String,
+    pub entry_candle_t: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -43,6 +44,8 @@ pub struct PaperTrade {
     pub pnl_usd: f64,
     pub reason: String,
     pub bars_held: usize,
+    pub entry_time_ms: u64,
+    pub exit_time_ms: u64,
 }
 
 impl PaperState {
@@ -102,6 +105,7 @@ impl PaperState {
                 opened_at_ms: 0,
                 bars_held: 0,
                 order_key: order.key.clone(),
+                entry_candle_t: 0,
             });
         } else {
             // Closing — mark for close at current price
@@ -173,6 +177,11 @@ impl PaperState {
 
     /// Force close at current price.
     pub fn close_position(&mut self, price: f64, reason: &str) {
+        self.close_position_at(price, reason, 0);
+    }
+
+    /// Force close at current price with exit timestamp.
+    pub fn close_position_at(&mut self, price: f64, reason: &str, exit_time_ms: u64) {
         let pos = match self.position.take() {
             Some(p) => p,
             None => return,
@@ -197,6 +206,8 @@ impl PaperState {
             pnl_usd,
             reason: reason.to_string(),
             bars_held: pos.bars_held,
+            entry_time_ms: pos.entry_candle_t,
+            exit_time_ms,
         });
     }
 
