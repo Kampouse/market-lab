@@ -341,6 +341,7 @@ fn worker_trade_args(definition: &TwapJobDefinition, size: f64) -> TradeArgs {
         config: None,
         venue: match definition.exchange {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
+            ExecutionVenue::OpenFinance => ExecutionVenueArg::Openfinance,
         },
         size: Some(size),
         margin: None,

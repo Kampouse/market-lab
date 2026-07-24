@@ -189,6 +189,7 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
     let script = Script::load(&job.definition.snapshot_path)?;
     let venue = job.definition.venue.map(|venue| match venue {
         crate::domain::execution::ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
+        crate::domain::execution::ExecutionVenue::OpenFinance => ExecutionVenueArg::Openfinance,
     });
     let args = ScriptRunArgs {
         script: job.definition.snapshot_path.display().to_string(),

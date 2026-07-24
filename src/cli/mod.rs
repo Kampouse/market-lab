@@ -287,12 +287,14 @@ impl AccountQueryArgs {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ExecutionVenueArg {
     Bulk,
+    Openfinance,
 }
 
 impl From<ExecutionVenueArg> for ExecutionVenue {
     fn from(value: ExecutionVenueArg) -> Self {
         match value {
             ExecutionVenueArg::Bulk => ExecutionVenue::Bulk,
+            ExecutionVenueArg::Openfinance => ExecutionVenue::OpenFinance,
         }
     }
 }

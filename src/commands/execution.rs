@@ -10,12 +10,13 @@ use crate::cli::{
 };
 use crate::credentials;
 use crate::domain::execution::{
-    CancelPlan, ExecutionReceipt, ExecutionVenue, OpenOrder, Position, PositionDirection,
-    TimeInForce, TradePlan,
+    CancelPlan, ExecutionReceipt, ExecutionVenue, OpenOrder, OrderKind, Position,
+    PositionDirection, TimeInForce, TradePlan,
 };
 use crate::providers::bulk::catalog::{self, BulkMarket};
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::market_data::BulkProvider;
+use crate::providers::openfinance::{self, OpenFinanceClient};
 
 pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Result<()> {
     args.validate_shape()?;
@@ -46,6 +47,26 @@ pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Resu
         }
     }
 
+    if let ExecutionVenueArg::Openfinance = args.venue {
+        // For OpenFinance, submit directly (bypass mlabd)
+        let client = OpenFinanceClient::new()?;
+        let coin = plan.venue_symbol.as_str();
+        let (asset_idx, _) = openfinance::resolve_asset_index(&client, coin).await?;
+        let is_buy = plan.direction == PositionDirection::Long;
+        let tif = if matches!(plan.order_kind, OrderKind::Market) { "Ioc" } else { "Gtc" };
+        let receipt = openfinance::place_order(
+            &client, asset_idx, is_buy, plan.size,
+            plan.price.unwrap_or(plan.reference_price), tif, plan.reduce_only,
+        ).await?;
+        println!("✅ order submitted (OpenFinance/Hyperliquid)");
+        println!("   {} {} {} @ ${:.4} (est. notional ${:.2})",
+            if is_buy { "BUY" } else { "SELL" },
+            plan.size, coin, plan.price.unwrap_or(plan.reference_price), plan.estimated_exposure);
+        if let Some(ref oid) = receipt.order_id {
+            println!("   order id: {oid}");
+        }
+        return Ok(());
+    }
     let receipt = crate::runtime::submit_trade(&plan).await?;
     let post_trade_position = if matches!(receipt.status.as_str(), "filled" | "partiallyFilled") {
         match BulkExecutionAdapter::new() {
@@ -72,12 +93,16 @@ pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Resu
 pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
     let symbol = validate_optional_symbol(args.symbol.as_deref())?;
-    let account = credentials::bulk_account()?;
     let snapshot = match args.venue {
         ExecutionVenueArg::Bulk => {
+            let account = credentials::bulk_account()?;
             BulkExecutionAdapter::new()?
                 .account_snapshot(&account)
                 .await?
+        }
+        ExecutionVenueArg::Openfinance => {
+            let client = OpenFinanceClient::new()?;
+            openfinance::get_account(&client).await?
         }
     };
     let positions = snapshot
@@ -91,9 +116,16 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
 pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
     let symbol = validate_optional_symbol(args.symbol.as_deref())?;
-    let account = credentials::bulk_account()?;
     let orders = match args.venue {
-        ExecutionVenueArg::Bulk => BulkExecutionAdapter::new()?.open_orders(&account).await?,
+        ExecutionVenueArg::Bulk => {
+            let account = credentials::bulk_account()?;
+            BulkExecutionAdapter::new()?.open_orders(&account).await?
+        }
+        ExecutionVenueArg::Openfinance => {
+            let client = OpenFinanceClient::new()?;
+            let raw = openfinance::get_open_orders(&client).await?;
+            raw.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect()
+        }
     }
     .into_iter()
     .filter(|order| symbol.is_none_or(|symbol| order.internal_symbol == symbol))
@@ -104,9 +136,16 @@ pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
 pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
     let symbol = validate_optional_symbol(args.symbol.as_deref())?;
-    let account = credentials::bulk_account()?;
     let fills = match args.venue {
-        ExecutionVenueArg::Bulk => BulkExecutionAdapter::new()?.fills(&account).await?,
+        ExecutionVenueArg::Bulk => {
+            let account = credentials::bulk_account()?;
+            BulkExecutionAdapter::new()?.fills(&account).await?
+        }
+        ExecutionVenueArg::Openfinance => {
+            let client = OpenFinanceClient::new()?;
+            let raw = openfinance::get_fills(&client).await?;
+            raw.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect()
+        }
     }
     .into_iter()
     .filter(|fill| symbol.is_none_or(|symbol| fill.internal_symbol == symbol))
@@ -133,6 +172,17 @@ pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
 
 pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
     args.validate()?;
+    
+    if let ExecutionVenueArg::Openfinance = args.venue {
+        let client = OpenFinanceClient::new()?;
+        // For OpenFinance, symbol is the coin name, order_id is numeric
+        let coin = args.symbol.split('/').next().unwrap_or(&args.symbol);
+        let (asset_idx, _) = openfinance::resolve_asset_index(&client, coin).await?;
+        let result = openfinance::cancel_order(&client, asset_idx, &args.order_id).await?;
+        println!("cancelled: {result}");
+        return Ok(());
+    }
+    
     let market = catalog::market(&args.symbol)?;
     bulk_keychain::Hash::from_base58(&args.order_id).context("invalid BULK order id")?;
     let account = credentials::bulk_account()?;
@@ -162,12 +212,16 @@ pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
 pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
     args.validate()?;
     let requested_symbol = validate_optional_symbol(args.symbol.as_deref())?;
-    let account = credentials::bulk_account()?;
     let snapshot = match args.venue {
         ExecutionVenueArg::Bulk => {
+            let _account = credentials::bulk_account()?;
             BulkExecutionAdapter::new()?
-                .account_snapshot(&account)
+                .account_snapshot(&_account)
                 .await?
+        }
+        ExecutionVenueArg::Openfinance => {
+            let client = OpenFinanceClient::new()?;
+            openfinance::get_account(&client).await?
         }
     };
     let positions = snapshot
@@ -262,10 +316,14 @@ pub(crate) async fn build_trade_plan(
     args: &TradeArgs,
     direction: PositionDirection,
 ) -> Result<TradePlan> {
+    if let ExecutionVenueArg::Openfinance = args.venue {
+        return build_openfinance_trade_plan(args, direction).await;
+    }
     let market = catalog::market(&args.symbol)?;
     validate_market_rules(market, args)?;
     let account = match args.venue {
         ExecutionVenueArg::Bulk => credentials::bulk_account()?,
+        ExecutionVenueArg::Openfinance => unreachable!(),
     };
     let reference_price = match args.order_kind {
         TradeOrderKind::Limit => args
@@ -746,4 +804,63 @@ mod tests {
         assert_eq!(format_decimal(-0.004928, 2), "0");
         assert_eq!(format_decimal(9.9699138, 2), "9.97");
     }
+}
+
+/// Build a TradePlan for OpenFinance/Hyperliquid.
+async fn build_openfinance_trade_plan(
+    args: &TradeArgs,
+    direction: PositionDirection,
+) -> Result<TradePlan> {
+    let client = OpenFinanceClient::new()?;
+    let coin = args.symbol.split('/').next().unwrap_or(&args.symbol);
+    let (asset_idx, sz_decimals) = openfinance::resolve_asset_index(&client, coin).await?;
+    let price = openfinance::get_price(&client, coin).await?;
+
+    let leverage = args.leverage;
+    let margin = args.margin.unwrap_or_else(|| {
+        // If size is given instead, derive margin from size
+        if let Some(sz) = args.size {
+            sz * price / leverage
+        } else {
+            50.0
+        }
+    });
+    let notional = margin * leverage;
+    let raw_size = if let Some(sz) = args.size { sz } else { notional / price };
+    let lot_size = 10f64.powi(-(sz_decimals as i32));
+    let size = (raw_size / lot_size).floor() * lot_size;
+
+    let order_kind = match args.order_kind {
+        TradeOrderKind::Market => OrderKind::Market,
+        TradeOrderKind::Limit => OrderKind::Limit,
+    };
+
+    let limit_px = match order_kind {
+        OrderKind::Market => price,
+        OrderKind::Limit => args.price.context("limit orders require --price")?,
+    };
+
+    Ok(TradePlan {
+        created_at_ms: now_ms()?,
+        venue: ExecutionVenue::OpenFinance,
+        account: "hyperliquid".to_string(),
+        internal_symbol: format!("{coin}/USDT"),
+        venue_symbol: coin.to_string(),
+        direction,
+        side: direction.into(),
+        order_kind,
+        time_in_force: None,
+        requested_size: Some(raw_size),
+        size,
+        price: Some(limit_px),
+        reference_price: price,
+        requested_margin: Some(margin),
+        estimated_margin: margin,
+        estimated_exposure: size * price,
+        projected_liquidation_price: None,
+        leverage,
+        reduce_only: args.reduce_only,
+        stop_loss_price: args.sl,
+        take_profit_price: args.tp,
+    })
 }

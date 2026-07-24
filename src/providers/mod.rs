@@ -8,6 +8,7 @@ pub mod bulk;
 pub mod binance;
 pub mod marketlab_cloud;
 pub mod mmt;
+pub mod openfinance;
 
 use bulk::market_data::BulkProvider;
 use binance::market_data::BinanceProvider;
