@@ -498,6 +498,7 @@ fn now_ms() -> u64 {
 struct ScriptLiveStreams {
     mmt: Option<MmtScriptStreams>,
     bulk: Option<Box<BulkScriptStreams>>,
+
 }
 
 struct MmtScriptStreams {
@@ -1377,98 +1378,108 @@ mod tests {
 /// Streams live candle data, simulates fills with intrabar SL/TP.
 async fn run_paper(args: ScriptRunArgs) -> Result<()> {
     use crate::scripting::paper::PaperState;
-    use std::sync::{Arc, Mutex};
+    use crate::commands::script::binance_stream::{BinanceCandleStream, seconds_to_binance_interval};
+    use std::sync::atomic::AtomicBool;
 
     let script = Script::load(&args.script)?;
     let symbol = require_symbol(args.symbol.as_deref())?.to_string();
     let source_configs = parse_source_configs(&args.source)?;
-    validate_source_configs_for_run(&script.manifest, &source_configs)?;
     let raw_params = parse_param_values(&args.param)?;
     let resolved_params = resolve_params(&script.manifest, &raw_params)?;
-    let market = ScriptRunMarket { symbol: symbol.clone() };
 
-    let paper_state = Arc::new(Mutex::new(PaperState::new(100.0, 0.035)));
+    // Extract timeframe from source config
+    let tf_seconds = source_configs.values()
+        .filter_map(|c| c.timeframe.map(|t| t as u64))
+        .next()
+        .unwrap_or(300);
+    let interval = seconds_to_binance_interval(tf_seconds)?;
 
-    println!("📋 Paper trading mode — simulating locally (no exchange, no daemon)");
-    println!("   Strategy: {} | Symbol: {}", script.manifest.name, symbol);
+    let paper_state = std::sync::Arc::new(std::sync::Mutex::new(PaperState::new(100.0, 0.035)));
+
+    println!("\n📋 Paper trading mode — Binance WS (no exchange, no daemon)");
+    println!("   Strategy: {} | Symbol: {} | Interval: {}", script.manifest.name, symbol, interval);
     println!("   Press Ctrl+C to stop\n");
 
-    // Build the stream directly (reuse the existing stream infrastructure)
-    let mut report = crate::scripting::telemetry::ScriptRuntimeReportBuilder::new(
-        "script.paper",
-        &script,
-    );
+    // Connect to Binance WS
+    let mut stream = BinanceCandleStream::connect(&symbol, &interval).await?;
 
-    let mut streams = ScriptLiveStreams::connect(&source_configs, &market.symbol).await?;
-    let session = script.start_session_with_execution(
-        &resolved_params,
-        ScriptExecutionContext {
-            job_id: "paper".to_string(),
-            enabled: false, // No real execution
-        },
-    )?;
-
-    let cancel_handle = session.cancel_handle();
-    let _cancel_task = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            cancel_handle.store(true, Ordering::Relaxed);
-        }
-    });
+    // Start script session
+    let session = script.start_session(&resolved_params)?;
+    let selector = format!("candles@binance:timeframe={tf_seconds}");
 
     let mut hooks = 0_u64;
     let start_time = std::time::Instant::now();
-    let duration = args.duration.map(|d| std::time::Duration::from_secs(d));
+    let duration = args.duration.map(std::time::Duration::from_secs);
 
     loop {
+        if session.cancel_handle().load(Ordering::Relaxed) {
+            break;
+        }
         if let Some(dur) = duration {
             if start_time.elapsed() >= dur {
                 break;
             }
         }
 
-        // Poll for source events
-        let poll_result = streams.poll_sources(&session).await;
-        match poll_result {
-            Ok(events) => {
-                for event in events {
-                    let execution = session.run_execution_event(event.clone())?;
-                    if let Some(execution) = execution {
-                        // Process trade commands in paper mode
-                        {
-                            let mut ps = paper_state.lock().unwrap();
-                            for cmd in &execution.commands {
-                                match cmd {
-                                    ScriptExecutionCommand::Trade { order, request } => {
-                                        let _ = ps.process_trade(order, request);
-                                    }
-                                    ScriptExecutionCommand::Cancel { .. } => {}
-                                }
-                            }
-                            // Check intrabar exits
-                            // (The strategy handles exits in onData via close-long/close-short)
-                        }
-                        hooks += 1;
-                        if !execution.output.is_empty() {
-                            for output in &execution.output {
-                                if let Some(metrics) = output.get("metrics") {
-                                    if let Some(signal) = metrics.get("signal") {
-                                        let state = paper_state.lock().unwrap();
-                                        println!("[{}] signal: {} | capital: ${:.2}",
-                                            hooks, signal, state.capital);
-                                    }
-                                }
-                            }
-                        }
+        // Wait for next completed candle
+        let candle = match stream.next_candle().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("⚠️ {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        // Build payload and run strategy
+        let candle_json = serde_json::to_value(&candle)?;
+        let payload = json!({
+            "source": &selector,
+            "symbol": &symbol,
+            &selector: [candle_json.clone()],
+        });
+
+        session.record_source(
+            &selector,
+            payload.clone(),
+            None,
+        );
+
+        let execution = session.run_event(payload)?;
+
+        // Process trade commands
+        {
+            let mut ps = paper_state.lock().unwrap();
+            for cmd in &execution.commands {
+                match cmd {
+                    ScriptExecutionCommand::Trade { order, request } => {
+                        let _ = ps.process_trade(order, request);
                     }
+                    ScriptExecutionCommand::Cancel { .. } => {}
                 }
             }
-            Err(e) => {
-                eprintln!("stream error: {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
+
+            // Check intrabar exits using the candle high/low
+            ps.check_exits_intrabar(candle.h, candle.l);
+            ps.tick_bar();
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        hooks += 1;
+
+        // Print activity
+        if !execution.output.metrics.is_null() {
+            if let Some(metrics) = execution.output.metrics.as_object() {
+                let ps = paper_state.lock().unwrap();
+                if let Some(signal) = metrics.get("signal").and_then(|v| v.as_str()) {
+                    let side = metrics.get("side").and_then(|s| s.as_str()).unwrap_or("?");
+                    println!("[{hooks}] {side} {signal} | ${:.2} | candle ${:.4}",
+                        ps.capital, candle.c);
+                }
+                if let Some(exit) = metrics.get("exit").and_then(|v| v.as_str()) {
+                    println!("[{hooks}] exit: {exit} | ${:.2}", ps.capital);
+                }
+            }
+        }
     }
 
     // Print final summary
