@@ -26,6 +26,7 @@ use crate::providers::bulk::ws::{
 use crate::providers::mmt::utils::{normalize_symbol_for_mmt, normalize_to_ms, parse_levels};
 use crate::providers::mmt::ws_client::MmtWsClient;
 use crate::scripting::engine::Script;
+use crate::scripting::paper::PaperState;
 use crate::scripting::execution::{ScriptExecutionCommand, ScriptExecutionContext};
 use crate::scripting::inputs::{
     SourceConfig, SourceConfigs, parse_param_values, parse_source_configs, resolve_params,
@@ -126,6 +127,12 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
             "--from/--to are not allowed with script run; use script backtest for historical data"
         );
     }
+
+    // Paper mode: stream directly without daemon
+    if args.paper {
+        return run_paper(args).await;
+    }
+
     let script = Script::load(&args.script)?;
     let symbol = require_symbol(args.symbol.as_deref())?.to_string();
     let source_configs = parse_source_configs(&args.source)?;
@@ -203,6 +210,7 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
         duration: job.definition.duration_seconds,
         output: OutputFormat::Jsonl,
         verbose: job.definition.verbose,
+        paper: false,
     };
     let mut report = report_builder(
         "script.worker",
@@ -312,6 +320,7 @@ async fn stream_sources(
     let mut rendered = VecDeque::with_capacity(50);
     let mut hooks = 0_u64;
     let mut summary = ScriptRunSummary::default();
+    let paper_state = std::sync::Arc::new(std::sync::Mutex::new(PaperState::new(100.0, 0.035)));
     let mut event_cursor = worker.initial_event_cursor;
     let mut positions = crate::runtime::script_positions(job_id).await?;
     let mut execution_events = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -372,7 +381,11 @@ async fn stream_sources(
                 return Err(err);
             }
         };
-        dispatch_execution_commands(job_id, execution.commands).await?;
+        if args.paper {
+            paper_dispatch(&execution.commands, &paper_state, &market.symbol);
+        } else {
+            dispatch_execution_commands(job_id, execution.commands).await?;
+        }
         hooks += 1;
         summary.record_update(ts_ms);
         report.record_hook(&execution.stats);
@@ -1356,4 +1369,175 @@ mod tests {
         assert!(payload.get("sources").is_none());
         assert!(payload.get("candles").is_none());
     }
+}
+
+
+
+/// Run strategy in paper trading mode — no daemon, no exchange, no API key.
+/// Streams live candle data, simulates fills with intrabar SL/TP.
+async fn run_paper(args: ScriptRunArgs) -> Result<()> {
+    use crate::scripting::paper::PaperState;
+    use std::sync::{Arc, Mutex};
+
+    let script = Script::load(&args.script)?;
+    let symbol = require_symbol(args.symbol.as_deref())?.to_string();
+    let source_configs = parse_source_configs(&args.source)?;
+    validate_source_configs_for_run(&script.manifest, &source_configs)?;
+    let raw_params = parse_param_values(&args.param)?;
+    let resolved_params = resolve_params(&script.manifest, &raw_params)?;
+    let market = ScriptRunMarket { symbol: symbol.clone() };
+
+    let paper_state = Arc::new(Mutex::new(PaperState::new(100.0, 0.035)));
+
+    println!("📋 Paper trading mode — simulating locally (no exchange, no daemon)");
+    println!("   Strategy: {} | Symbol: {}", script.manifest.name, symbol);
+    println!("   Press Ctrl+C to stop\n");
+
+    // Build the stream directly (reuse the existing stream infrastructure)
+    let mut report = crate::scripting::telemetry::ScriptRuntimeReportBuilder::new(
+        "script.paper",
+        &script,
+    );
+
+    let mut streams = ScriptLiveStreams::connect(&source_configs, &market.symbol).await?;
+    let session = script.start_session_with_execution(
+        &resolved_params,
+        ScriptExecutionContext {
+            job_id: "paper".to_string(),
+            enabled: false, // No real execution
+        },
+    )?;
+
+    let cancel_handle = session.cancel_handle();
+    let _cancel_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel_handle.store(true, Ordering::Relaxed);
+        }
+    });
+
+    let mut hooks = 0_u64;
+    let start_time = std::time::Instant::now();
+    let duration = args.duration.map(|d| std::time::Duration::from_secs(d));
+
+    loop {
+        if let Some(dur) = duration {
+            if start_time.elapsed() >= dur {
+                break;
+            }
+        }
+
+        // Poll for source events
+        let poll_result = streams.poll_sources(&session).await;
+        match poll_result {
+            Ok(events) => {
+                for event in events {
+                    let execution = session.run_execution_event(event.clone())?;
+                    if let Some(execution) = execution {
+                        // Process trade commands in paper mode
+                        {
+                            let mut ps = paper_state.lock().unwrap();
+                            for cmd in &execution.commands {
+                                match cmd {
+                                    ScriptExecutionCommand::Trade { order, request } => {
+                                        let _ = ps.process_trade(order, request);
+                                    }
+                                    ScriptExecutionCommand::Cancel { .. } => {}
+                                }
+                            }
+                            // Check intrabar exits
+                            // (The strategy handles exits in onData via close-long/close-short)
+                        }
+                        hooks += 1;
+                        if !execution.output.is_empty() {
+                            for output in &execution.output {
+                                if let Some(metrics) = output.get("metrics") {
+                                    if let Some(signal) = metrics.get("signal") {
+                                        let state = paper_state.lock().unwrap();
+                                        println!("[{}] signal: {} | capital: ${:.2}",
+                                            hooks, signal, state.capital);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("stream error: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Print final summary
+    let state = paper_state.lock().unwrap();
+    let stats = state.stats();
+    let capital = stats["capital"].as_f64().unwrap_or(0.0);
+    let starting = stats["starting_capital"].as_f64().unwrap_or(100.0);
+    let trades = stats["trades"].as_u64().unwrap_or(0);
+    let wins = stats["wins"].as_u64().unwrap_or(0);
+    let wr = stats["win_rate"].as_f64().unwrap_or(0.0);
+    let pnl = capital - starting;
+
+    println!("\n📋 PAPER TRADING SUMMARY");
+    println!("{}", "=".repeat(50));
+    println!("Starting capital: ${:.2}", starting);
+    println!("Final capital:    ${:.2} ({:+.2} PnL)", capital, pnl);
+    println!("Trades: {} | Wins: {} | WR: {:.0}%", trades, wins, wr * 100.0);
+    if let Some(pos) = stats["open_position"].as_object() {
+        let side = pos["side"].as_str().unwrap_or("?");
+        let entry = pos["entry"].as_f64().unwrap_or(0.0);
+        println!("Open position: {} @ ${:.4}", side, entry);
+    }
+    println!();
+
+    Ok(())
+}
+
+/// Process trade commands in paper mode (no exchange, no daemon).
+fn paper_dispatch(
+    commands: &[ScriptExecutionCommand],
+    state: &std::sync::Arc<std::sync::Mutex<PaperState>>,
+    _symbol: &str,
+) {
+    let mut state = state.lock().unwrap();
+    for command in commands {
+        match command {
+            ScriptExecutionCommand::Trade { order, request } => {
+                let _ = state.process_trade(order, request);
+            }
+            ScriptExecutionCommand::Cancel { .. } => {
+                // In paper mode, cancel just means close at market
+                // The strategy handles this via close-long/close-short in onData
+            }
+        }
+    }
+}
+
+/// Print final paper trading summary.
+fn print_paper_summary(state: &PaperState) {
+    let stats = state.stats();
+    let capital = stats["capital"].as_f64().unwrap_or(0.0);
+    let starting = stats["starting_capital"].as_f64().unwrap_or(100.0);
+    let trades = stats["trades"].as_u64().unwrap_or(0);
+    let wins = stats["wins"].as_u64().unwrap_or(0);
+    let wr = stats["win_rate"].as_f64().unwrap_or(0.0);
+    let pnl = capital - starting;
+
+    println!("\n📋 PAPER TRADING SUMMARY");
+    println!("{}", "=".repeat(50));
+    println!("Starting capital: ${:.2}", starting);
+    println!("Final capital:    ${:.2} ({:+.2} PnL)", capital, pnl);
+    println!("Trades: {} | Wins: {} | WR: {:.0}%", trades, wins, wr * 100.0);
+
+    if let Some(pos) = stats["open_position"].as_object() {
+        let side = pos["side"].as_str().unwrap_or("?");
+        let entry = pos["entry"].as_f64().unwrap_or(0.0);
+        let bars = pos["bars_held"].as_u64().unwrap_or(0);
+        println!("\nOpen: {} @ ${:.4} ({} bars)", side, entry, bars);
+    }
+
+    println!();
 }

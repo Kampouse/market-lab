@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod execution;
+pub mod paper;
 pub mod inputs;
 pub mod jobs;
 pub mod limits;

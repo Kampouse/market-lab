@@ -459,6 +459,9 @@ pub struct ScriptRunArgs {
     pub output: OutputFormat,
     #[arg(long, default_value_t = false)]
     pub verbose: bool,
+    /// Simulate trades locally instead of sending to an exchange. No daemon or API key needed.
+    #[arg(long, default_value_t = false)]
+    pub paper: bool,
 }
 
 #[derive(Clone, Debug, Args)]
