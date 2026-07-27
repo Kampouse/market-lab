@@ -1383,10 +1383,14 @@ mod tests {
 
 
 /// Run strategy in paper trading mode — no daemon, no exchange, no API key.
-/// Streams live candle data, simulates fills with intrabar SL/TP.
+/// Streams live candle data from Binance WS, simulates fills with intrabar SL/TP.
+/// Supports multi-symbol streams when per-source `:symbol=` overrides are used.
 async fn run_paper(args: ScriptRunArgs) -> Result<()> {
     use crate::scripting::paper::PaperState;
-    use crate::commands::script::binance_stream::{BinanceCandleStream, seconds_to_binance_interval};
+    use crate::commands::script::binance_stream::{
+        BinanceCandleStream, BinanceMultiCandleStream, seconds_to_binance_interval,
+    };
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::AtomicBool;
 
     let script = Script::load(&args.script)?;
@@ -1396,101 +1400,200 @@ async fn run_paper(args: ScriptRunArgs) -> Result<()> {
     let resolved_params = resolve_params(&script.manifest, &raw_params)?;
 
     // Extract timeframe from source config
-    let tf_seconds = source_configs.values()
+    let tf_seconds = source_configs
+        .values()
         .filter_map(|c| c.timeframe.map(|t| t as u64))
         .next()
         .unwrap_or(300);
     let interval = seconds_to_binance_interval(tf_seconds)?;
 
-    let paper_state = std::sync::Arc::new(std::sync::Mutex::new(PaperState::new(100.0, 0.035)));
+    // Collect all unique symbols from source configs (per-source overrides + trading symbol)
+    let mut all_symbols: Vec<String> = Vec::new();
+    let mut symbol_to_selectors: HashMap<String, Vec<String>> = HashMap::new();
+    for config in source_configs.values() {
+        let sym = config.resolve_symbol(&symbol);
+        symbol_to_selectors
+            .entry(sym.clone())
+            .or_default()
+            .push(config.selector.clone());
+        if !all_symbols.contains(&sym) {
+            all_symbols.push(sym);
+        }
+    }
+    // Ensure the trading symbol is in the list
+    if !all_symbols.contains(&symbol) {
+        all_symbols.insert(0, symbol.clone());
+    }
+
+    let is_multi = all_symbols.len() > 1;
+    let margin = resolved_params
+        .get("margin")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(100.0) as f64;
+    let paper_state = std::sync::Arc::new(std::sync::Mutex::new(PaperState::new(margin, 0.035)));
 
     println!("\n📋 Paper trading mode — Binance WS (no exchange, no daemon)");
-    println!("   Strategy: {} | Symbol: {} | Interval: {}", script.manifest.name, symbol, interval);
+    println!(
+        "   Strategy: {} | Symbol: {} | Interval: {}",
+        script.manifest.name, symbol, interval
+    );
+    if is_multi {
+        println!("   Multi-symbol: {}", all_symbols.join(", "));
+    }
     println!("   Press Ctrl+C to stop\n");
-
-    // Connect to Binance WS
-    let mut stream = BinanceCandleStream::connect(&symbol, &interval).await?;
 
     // Start script session
     let session = script.start_session(&resolved_params)?;
-    let selector = format!("candles@binance:timeframe={tf_seconds}");
+    let base_selector = format!("candles@binance_futures:timeframe={tf_seconds}");
 
     let mut hooks = 0_u64;
     let start_time = std::time::Instant::now();
     let duration = args.duration.map(std::time::Duration::from_secs);
 
-    loop {
-        if session.cancel_handle().load(Ordering::Relaxed) {
-            break;
-        }
-        if let Some(dur) = duration {
-            if start_time.elapsed() >= dur {
+    if is_multi {
+        // Multi-symbol path: subscribe to all symbols via combined WS stream
+        let mut stream =
+            BinanceMultiCandleStream::connect_multi(&all_symbols, &interval).await?;
+
+        loop {
+            if session.cancel_handle().load(Ordering::Relaxed) {
                 break;
             }
-        }
-
-        // Wait for next completed candle
-        let candle = match stream.next_candle().await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("⚠️ {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
+            if let Some(dur) = duration {
+                if start_time.elapsed() >= dur {
+                    break;
+                }
             }
-        };
 
-        // Build payload and run strategy
-        let candle_json = serde_json::to_value(&candle)?;
-        let payload = json!({
-            "source": &selector,
-            "symbol": &symbol,
-            &selector: [candle_json.clone()],
-        });
+            let (candle_symbol, candle) = match stream.next_candle().await {
+                Ok(item) => item,
+                Err(e) => {
+                    eprintln!("⚠️ {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
 
-        session.record_source(
-            &selector,
-            payload.clone(),
-            None,
-        );
+            // Find the selector for this symbol
+            let default_selectors: Vec<String> = vec![base_selector.clone()];
+            let selectors = symbol_to_selectors
+                .get(&candle_symbol)
+                .unwrap_or(&default_selectors);
+            let selector = selectors.first().cloned().unwrap_or(base_selector.clone());
 
-        let execution = session.run_event(payload)?;
+            let candle_json = serde_json::to_value(&candle)?;
+            let payload = json!({
+                "source": &selector,
+                "symbol": &candle_symbol,
+                "source_type": "candles",
+                "source_configs": crate::scripting::inputs::source_configs_payload(&source_configs),
+                &selector: [candle_json.clone()],
+                "positions": { "open": [] },
+            });
 
-        // Process trade commands
-        {
-            let mut ps = paper_state.lock().unwrap();
-            for cmd in &execution.commands {
-                match cmd {
-                    ScriptExecutionCommand::Trade { order, request } => {
-                        let _ = ps.process_trade(order, request);
-                        // Stamp entry time with current candle
-                        if let Some(pos) = &mut ps.position {
-                            pos.entry_candle_t = candle.t;
+            session.record_source(&selector, payload.clone(), None);
+            let execution = session.run_event(payload)?;
+
+            {
+                let mut ps = paper_state.lock().unwrap();
+                for cmd in &execution.commands {
+                    match cmd {
+                        ScriptExecutionCommand::Trade { order, request } => {
+                            let _ = ps.process_trade(order, request);
+                            if let Some(pos) = &mut ps.position {
+                                pos.entry_candle_t = candle.t;
+                            }
                         }
+                        ScriptExecutionCommand::Cancel { .. } => {}
                     }
-                    ScriptExecutionCommand::Cancel { .. } => {}
+                }
+                let exited = ps.check_exits_intrabar(candle.h, candle.l);
+                if !exited {
+                    ps.tick_bar();
                 }
             }
 
-            // Check intrabar exits using the candle high/low
-            let exited = ps.check_exits_intrabar(candle.h, candle.l);
-            if !exited {
-                ps.tick_bar();
+            hooks += 1;
+
+            // Print activity
+            if !execution.output.metrics.is_null() {
+                if let Some(metrics) = execution.output.metrics.as_object() {
+                    let ps = paper_state.lock().unwrap();
+                    if let Some(signal) = metrics.get("signal").and_then(|v| v.as_str()) {
+                        println!(
+                            "[{hooks}] {candle_symbol} {signal} | ${:.2} | candle ${:.4}",
+                            ps.capital,
+                            candle.c
+                        );
+                    }
+                }
             }
         }
+    } else {
+        // Single-symbol path (original)
+        let mut stream = BinanceCandleStream::connect(&symbol, &interval).await?;
+        let selector = format!("candles@binance:timeframe={tf_seconds}");
 
-        hooks += 1;
-
-        // Print activity
-        if !execution.output.metrics.is_null() {
-            if let Some(metrics) = execution.output.metrics.as_object() {
-                let ps = paper_state.lock().unwrap();
-                if let Some(signal) = metrics.get("signal").and_then(|v| v.as_str()) {
-                    let side = metrics.get("side").and_then(|s| s.as_str()).unwrap_or("?");
-                    println!("[{hooks}] {side} {signal} | ${:.2} | candle ${:.4}",
-                        ps.capital, candle.c);
+        loop {
+            if session.cancel_handle().load(Ordering::Relaxed) {
+                break;
+            }
+            if let Some(dur) = duration {
+                if start_time.elapsed() >= dur {
+                    break;
                 }
-                if let Some(exit) = metrics.get("exit").and_then(|v| v.as_str()) {
-                    println!("[{hooks}] exit: {exit} | ${:.2}", ps.capital);
+            }
+
+            let candle = match stream.next_candle().await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("⚠️ {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+
+            let candle_json = serde_json::to_value(&candle)?;
+            let payload = json!({
+                "source": &selector,
+                "symbol": &symbol,
+                &selector: [candle_json.clone()],
+            });
+
+            session.record_source(&selector, payload.clone(), None);
+            let execution = session.run_event(payload)?;
+
+            {
+                let mut ps = paper_state.lock().unwrap();
+                for cmd in &execution.commands {
+                    match cmd {
+                        ScriptExecutionCommand::Trade { order, request } => {
+                            let _ = ps.process_trade(order, request);
+                            if let Some(pos) = &mut ps.position {
+                                pos.entry_candle_t = candle.t;
+                            }
+                        }
+                        ScriptExecutionCommand::Cancel { .. } => {}
+                    }
+                }
+                let exited = ps.check_exits_intrabar(candle.h, candle.l);
+                if !exited {
+                    ps.tick_bar();
+                }
+            }
+
+            hooks += 1;
+
+            if !execution.output.metrics.is_null() {
+                if let Some(metrics) = execution.output.metrics.as_object() {
+                    let ps = paper_state.lock().unwrap();
+                    if let Some(signal) = metrics.get("signal").and_then(|v| v.as_str()) {
+                        println!(
+                            "[{hooks}] {signal} | ${:.2} | candle ${:.4}",
+                            ps.capital,
+                            candle.c
+                        );
+                    }
                 }
             }
         }
@@ -1500,7 +1603,7 @@ async fn run_paper(args: ScriptRunArgs) -> Result<()> {
     let state = paper_state.lock().unwrap();
     let stats = state.stats();
     let capital = stats["capital"].as_f64().unwrap_or(0.0);
-    let starting = stats["starting_capital"].as_f64().unwrap_or(100.0);
+    let starting = stats["starting_capital"].as_f64().unwrap_or(margin);
     let trades = stats["trades"].as_u64().unwrap_or(0);
     let wins = stats["wins"].as_u64().unwrap_or(0);
     let wr = stats["win_rate"].as_f64().unwrap_or(0.0);
@@ -1527,7 +1630,12 @@ async fn run_paper(args: ScriptRunArgs) -> Result<()> {
             for (i, t) in state.trades.iter().enumerate() {
                 println!(
                     "{:>3}  {:<6}  {:>9.4}  {:>9.4}  {:>+6.2}%  {}",
-                    i + 1, t.side, t.entry, t.exit, t.net_pnl_pct, t.reason
+                    i + 1,
+                    t.side,
+                    t.entry,
+                    t.exit,
+                    t.net_pnl_pct,
+                    t.reason
                 );
             }
             println!("{}", "-".repeat(50));
