@@ -1730,6 +1730,16 @@ fn resolve_source_provider(
     if exchange.eq_ignore_ascii_case("bulk") {
         return Ok(CliProviderKind::Bulk);
     }
+    if exchange.eq_ignore_ascii_case("binance") {
+        return Ok(CliProviderKind::Binance);
+    }
+    if exchange.eq_ignore_ascii_case("binancef")
+        || exchange.eq_ignore_ascii_case("binance_futures")
+        || exchange.eq_ignore_ascii_case("binance-futures")
+        || exchange.eq_ignore_ascii_case("binancefutures")
+    {
+        return Ok(CliProviderKind::BinanceFutures);
+    }
     bail!(
         "standalone exchange `{exchange}` is not supported yet; use --provider mmt when `{exchange}` is routed through MMT"
     )
@@ -1754,6 +1764,15 @@ fn resolve_system_provider(
         }
         (Some(CliDataProvider::Mmt), _) => Ok(ProviderKind::Mmt),
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => Ok(ProviderKind::Bulk),
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("binance") => Ok(ProviderKind::Binance),
+        (None, Some(exchange))
+            if exchange.eq_ignore_ascii_case("binancef")
+                || exchange.eq_ignore_ascii_case("binance_futures")
+                || exchange.eq_ignore_ascii_case("binance-futures")
+                || exchange.eq_ignore_ascii_case("binancefutures") =>
+        {
+            Ok(ProviderKind::BinanceFutures)
+        }
         (None, Some(exchange)) => bail!("unsupported standalone exchange `{exchange}`"),
         (None, None) => Ok(ProviderKind::MarketLab),
     }
@@ -2652,7 +2671,7 @@ mod tests {
             "source",
             "orderbook",
             "--exchange",
-            "binancef",
+            "kraken",
             "--symbol",
             "BTC/USDT",
         ])
@@ -2663,7 +2682,7 @@ mod tests {
             } => {
                 let error = args
                     .validate()
-                    .expect_err("binancef is not a standalone exchange yet");
+                    .expect_err("kraken is not a standalone exchange");
                 assert!(error.to_string().contains("--provider mmt"));
             }
             _ => panic!("expected standalone orderbook command"),

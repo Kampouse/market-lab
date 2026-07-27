@@ -27,6 +27,7 @@ pub enum ProviderClient {
     Mmt,
     Bulk,
     Binance,
+    BinanceFutures,
 }
 
 impl ProviderClient {
@@ -35,7 +36,8 @@ impl ProviderClient {
             ProviderKind::MarketLab => Self::MarketLab,
             ProviderKind::Mmt => Self::Mmt,
             ProviderKind::Bulk => Self::Bulk,
-            ProviderKind::Binance | ProviderKind::BinanceFutures => Self::Binance,
+            ProviderKind::Binance => Self::Binance,
+            ProviderKind::BinanceFutures => Self::BinanceFutures,
         }
     }
 }
@@ -46,7 +48,7 @@ impl MarketDataProvider for ProviderClient {
             Self::MarketLab => MarketLabProvider::inspect(req).await,
             Self::Mmt => MmtProvider::inspect(req).await,
             Self::Bulk => BulkProvider::inspect_historical().await,
-            Self::Binance => bail!("Binance inspect not supported"),
+            Self::Binance | Self::BinanceFutures => bail!("Binance inspect not supported"),
         }
     }
 
@@ -55,7 +57,7 @@ impl MarketDataProvider for ProviderClient {
             Self::MarketLab => MarketLabProvider::replay(req).await,
             Self::Mmt => MmtProvider::replay(req).await,
             Self::Bulk => BulkProvider::replay_historical().await,
-            Self::Binance => bail!("Binance replay not supported"),
+            Self::Binance | Self::BinanceFutures => bail!("Binance replay not supported"),
         }
     }
 
@@ -65,6 +67,7 @@ impl MarketDataProvider for ProviderClient {
             Self::Mmt => MmtProvider::health().await,
             Self::Bulk => BulkProvider::health().await,
             Self::Binance => BinanceProvider::health().await,
+            Self::BinanceFutures => BinanceProvider::health_futures().await,
         }
     }
 }

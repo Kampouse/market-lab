@@ -347,7 +347,7 @@ async fn backtest_events(
     if events.is_empty() {
         bail!("script backtest received no source events in the requested range");
     }
-    let reference_source = resolve_reference_source(&data, &source_configs)?;
+    let reference_source = resolve_reference_source(&data, &source_configs, &args.symbol)?;
     let reference_selector = reference_source.selector.clone();
 
     let mut returns = Vec::new();
@@ -588,6 +588,7 @@ async fn fetch_mmt_sources(
     for config in configs {
         let source = &config.source;
         let exchange = config.exchange.as_str();
+        let symbol = config.resolve_symbol(&args.symbol);
         match source {
             ScriptSource::Candles => {
                 let timeframe = config.require_timeframe(source)?;
@@ -597,11 +598,11 @@ async fn fetch_mmt_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching candles exchange={} symbol={} tf={} from={} to={}",
-                    exchange, args.symbol, timeframe, args.from, args.to
+                    exchange, symbol, timeframe, args.from, args.to
                 );
                 let series = {
                     let future =
-                        MmtProvider::candles(exchange, &args.symbol, tf, args.from, args.to);
+                        MmtProvider::candles(exchange, &symbol, tf, args.from, args.to);
                     tokio::select! {
                         result = future => result?,
                         _ = &mut cancel => {
@@ -641,11 +642,11 @@ async fn fetch_mmt_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching orderbooks exchange={} symbol={} tf={} from={} to={} depth={}",
-                    exchange, args.symbol, timeframe, args.from, args.to, depth
+                    exchange, symbol, timeframe, args.from, args.to, depth
                 );
                 let future = MmtProvider::historical_orderbooks(
                     exchange,
-                    &args.symbol,
+                    &symbol,
                     tf,
                     args.from,
                     args.to,
@@ -681,10 +682,10 @@ async fn fetch_mmt_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching vd exchange={} symbol={} tf={} from={} to={} bucket={}",
-                    exchange, args.symbol, timeframe, args.from, args.to, bucket
+                    exchange, symbol, timeframe, args.from, args.to, bucket
                 );
                 let future =
-                    MmtProvider::vd(exchange, &args.symbol, tf, args.from, args.to, bucket);
+                    MmtProvider::vd(exchange, &symbol, tf, args.from, args.to, bucket);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
@@ -722,9 +723,9 @@ async fn fetch_mmt_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching oi exchange={} symbol={} tf={} from={} to={}",
-                    exchange, args.symbol, timeframe, args.from, args.to
+                    exchange, symbol, timeframe, args.from, args.to
                 );
-                let future = MmtProvider::oi(exchange, &args.symbol, tf, args.from, args.to);
+                let future = MmtProvider::oi(exchange, &symbol, tf, args.from, args.to);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
@@ -762,9 +763,9 @@ async fn fetch_mmt_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching volumes exchange={} symbol={} tf={} from={} to={}",
-                    exchange, args.symbol, timeframe, args.from, args.to
+                    exchange, symbol, timeframe, args.from, args.to
                 );
-                let future = MmtProvider::volumes(exchange, &args.symbol, tf, args.from, args.to);
+                let future = MmtProvider::volumes(exchange, &symbol, tf, args.from, args.to);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
@@ -815,6 +816,7 @@ async fn fetch_bulk_sources(
         let source = &config.source;
         let timeframe = config.require_timeframe(source)?;
         let interval = crate::providers::bulk::market_data::timeframe_from_seconds(timeframe)?;
+        let symbol = config.resolve_symbol(&args.symbol);
         let phase = match source {
             ScriptSource::Candles => "fetching_candles",
             ScriptSource::Volumes => "fetching_volumes",
@@ -831,12 +833,12 @@ async fn fetch_bulk_sources(
         eprintln!(
             "fetching BULK {} symbol={} tf={} from={} to={}",
             source.as_str(),
-            args.symbol,
+            symbol,
             timeframe,
             args.from,
             args.to
         );
-        let future = BulkProvider::candles(&args.symbol, interval, args.from, args.to);
+        let future = BulkProvider::candles(&symbol, interval, args.from, args.to);
         let series = tokio::select! {
             result = future => result?,
             _ = &mut cancel => {
@@ -907,6 +909,7 @@ async fn fetch_binance_sources(
         let timeframe = config.require_timeframe(source)?;
         let interval = standard_timeframe_from_seconds(timeframe)?;
         let is_futures = config.provider == ProviderKind::BinanceFutures;
+        let symbol = config.resolve_symbol(&args.symbol);
 
         match source {
             ScriptSource::Candles => {}
@@ -926,7 +929,7 @@ async fn fetch_binance_sources(
             "fetching Binance{} {} symbol={} tf={} from={} to={}",
             if is_futures { " Futures" } else { "" },
             source.as_str(),
-            args.symbol,
+            symbol,
             timeframe,
             args.from,
             args.to
@@ -934,7 +937,7 @@ async fn fetch_binance_sources(
 
         let series = if is_futures {
             let future = BinanceProvider::candles_paginated_futures(
-                &args.symbol, &interval, args.from, args.to,
+                &symbol, &interval, args.from, args.to,
             );
             tokio::select! {
                 result = future => result?,
@@ -945,7 +948,7 @@ async fn fetch_binance_sources(
             }
         } else {
             let future = BinanceProvider::candles_paginated(
-                &args.symbol, &interval, args.from, args.to,
+                &symbol, &interval, args.from, args.to,
             );
             tokio::select! {
                 result = future => result?,
@@ -1015,7 +1018,12 @@ fn build_event_payload(ctx: EventPayloadContext<'_>) -> Result<Value> {
         "exchange".to_string(),
         Value::String(ctx.config.exchange.clone()),
     );
-    root.insert("symbol".to_string(), Value::String(ctx.symbol.to_string()));
+    // Use per-source symbol override if set, else fall back to the global --symbol.
+    let event_symbol = ctx.config.resolve_symbol(ctx.symbol);
+    root.insert(
+        "symbol".to_string(),
+        Value::String(event_symbol),
+    );
     root.insert(
         "source".to_string(),
         Value::String(ctx.config.selector.clone()),
@@ -1069,10 +1077,29 @@ fn build_event_timeline(
 fn resolve_reference_source<'a>(
     data: &BacktestData,
     source_configs: &'a SourceConfigs,
+    trading_symbol: &str,
 ) -> Result<&'a SourceConfig> {
     let mut configs = source_configs.values().collect::<Vec<_>>();
     configs.sort_by_key(|config| config.position);
-    for config in configs {
+    // Prefer a source whose symbol matches the trading symbol (the --symbol arg).
+    // This ensures execution fills use the correct asset when a signal source
+    // (e.g. BTC/USDT) precedes the traded asset (e.g. NEAR/USDT) in --source order.
+    // First try: source symbol == trading symbol.
+    for config in &configs {
+        if config.resolve_symbol(trading_symbol) == trading_symbol {
+            let series = data
+                .series
+                .get(&config.selector)
+                .with_context(|| format!("{} data not loaded", config.selector))?;
+            for idx in 0..backtest_series_len(series) {
+                if backtest_series_reference_price(series, idx)?.is_some() {
+                    return Ok(config);
+                }
+            }
+        }
+    }
+    // Fallback: first price-bearing source (original behaviour).
+    for config in &configs {
         let series = data
             .series
             .get(&config.selector)
@@ -2270,7 +2297,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_reference_source(&data, &configs)
+            resolve_reference_source(&data, &configs, "BTC/USDT")
                 .expect("resolve reference source")
                 .selector,
             "candles@binancef@mmt"

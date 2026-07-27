@@ -50,7 +50,20 @@ impl From<BinanceKline> for OhlcvCandle {
 
 impl BinanceProvider {
     pub async fn health() -> Result<ProviderHealth> {
-        let client = BinanceClient::new()?;
+        Self::health_for(false).await
+    }
+
+    pub async fn health_futures() -> Result<ProviderHealth> {
+        Self::health_for(true).await
+    }
+
+    async fn health_for(futures: bool) -> Result<ProviderHealth> {
+        let client = if futures {
+            BinanceClient::new_futures()?
+        } else {
+            BinanceClient::new()?
+        };
+        let label = if futures { "binance_futures" } else { EXCHANGE };
         // Binance /ping returns {} on success — no query params needed.
         let url = client.url("ping");
         let response = client.http().get(&url).send().await
@@ -59,7 +72,7 @@ impl BinanceProvider {
         let details = response.json::<serde_json::Value>().await
             .unwrap_or(serde_json::json!({}));
         Ok(ProviderHealth {
-            provider: EXCHANGE.to_string(),
+            provider: label.to_string(),
             status: status.to_string(),
             details,
         })

@@ -18,6 +18,10 @@ pub struct SourceConfig {
     pub timeframe: Option<u32>,
     pub depth: Option<u16>,
     pub bucket: Option<u8>,
+    /// Per-source symbol override. When None, the backtest/run `--symbol` is used.
+    /// When Some, this source fetches data for the specified symbol (e.g. BTC/USDT
+    /// as a signal source while trading NEAR/USDT).
+    pub symbol: Option<String>,
 }
 
 impl SourceConfig {
@@ -37,6 +41,7 @@ impl SourceConfig {
             timeframe: None,
             depth: None,
             bucket: None,
+            symbol: None,
         }
     }
 
@@ -55,8 +60,17 @@ impl SourceConfig {
 
     pub fn require_bucket(&self, source: &ScriptSource) -> Result<u8> {
         self.bucket.ok_or_else(|| {
-            anyhow::anyhow!("--source {}:bucket=<1..=11> is required", source.as_str())
+            anyhow::anyhow!(
+                "--source {}:bucket=<1..=11> is required",
+                source.as_str()
+            )
         })
+    }
+
+    /// Returns the per-source symbol override if set, else falls back to the
+    /// global `--symbol` passed to the backtest/run command.
+    pub fn resolve_symbol(&self, fallback: &str) -> String {
+        self.symbol.clone().unwrap_or_else(|| fallback.to_string())
     }
 }
 
@@ -72,7 +86,21 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
             .map_or((value.as_str(), ""), |(binding, options)| {
                 (binding, options)
             });
-        let (selector, source, provider, exchange) = parse_source_selector(binding)?;
+        let (base_selector, source, provider, exchange) = parse_source_selector(binding)?;
+
+        // Pre-scan options for a symbol= override so we can include it in the
+        // selector key. This prevents two sources from the same exchange with
+        // different symbols from colliding in the config map.
+        let per_source_symbol = if options.is_empty() {
+            None
+        } else {
+            extract_symbol_option(options)?
+        };
+        let selector = match &per_source_symbol {
+            Some(sym) => format!("{}:symbol={}", base_selector, sym),
+            None => base_selector.clone(),
+        };
+
         let config = configs.entry(selector.clone()).or_insert_with(|| {
             SourceConfig::new(
                 selector.clone(),
@@ -82,6 +110,10 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
                 position,
             )
         });
+        // Store the per-source symbol on the config.
+        if let Some(sym) = &per_source_symbol {
+            config.symbol = Some(sym.clone());
+        }
         if config.provider != provider || config.exchange != exchange {
             bail!(
                 "--source `{selector}` cannot bind both {} and {exchange}",
@@ -113,6 +145,17 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
                     .is_some(),
                 (ScriptSource::Vd, "bucket") => {
                     config.bucket.replace(parse_bucket(raw_value)?).is_some()
+                }
+                (_, "symbol") => {
+                    // Already pre-scanned; just validate and store.
+                    let sym = raw_value.trim().to_string();
+                    if !sym.contains('/') || sym.starts_with('/') || sym.ends_with('/') {
+                        bail!(
+                            "--source {selector}:symbol must look like BASE/QUOTE, e.g. BTC/USDT"
+                        );
+                    }
+                    // Don't flag as duplicate — symbol was pre-scanned
+                    false
                 }
                 _ => bail!("unknown --source {selector}:{key}"),
             };
@@ -204,6 +247,7 @@ pub fn source_configs_payload(configs: &SourceConfigs) -> Value {
                 "timeframe_sec": config.timeframe,
                 "depth": config.depth,
                 "bucket": config.bucket,
+                "symbol": config.symbol,
             }),
         );
     }
@@ -433,7 +477,9 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
         "mmt" => Ok(ProviderKind::Mmt),
         "bulk" => Ok(ProviderKind::Bulk),
         "binance" => Ok(ProviderKind::Binance),
-        "binance_futures" | "binancefutures" => Ok(ProviderKind::BinanceFutures),
+        "binance_futures" | "binancefutures" | "binancef" | "binance-futures" => {
+            Ok(ProviderKind::BinanceFutures)
+        }
         other => bail!("unsupported script source provider `{other}`"),
     }
 }
@@ -466,16 +512,34 @@ fn reject_duplicate_resolved_sources(configs: &SourceConfigs) -> Result<()> {
             if left.source == right.source
                 && left.provider == right.provider
                 && left.exchange == right.exchange
+                && left.symbol == right.symbol
             {
                 bail!(
-                    "duplicate script source {} for exchange {}",
+                    "duplicate script source {} for exchange {} symbol {}",
                     left.source.as_str(),
-                    left.exchange
+                    left.exchange,
+                    left.symbol.as_deref().unwrap_or("(default)")
                 );
             }
         }
     }
     Ok(())
+}
+
+/// Pre-scan source options for `symbol=BASE/QUOTE`. Returns None if not present.
+fn extract_symbol_option(options: &str) -> Result<Option<String>> {
+    for option in options.split(',') {
+        if let Some((key, raw_value)) = option.split_once('=') {
+            if key.trim() == "symbol" {
+                let sym = raw_value.trim().to_string();
+                if !sym.contains('/') || sym.starts_with('/') || sym.ends_with('/') {
+                    bail!("--source symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+                }
+                return Ok(Some(sym));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn parse_positive_u32(raw: &str, key: &str) -> Result<u32> {
