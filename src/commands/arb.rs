@@ -38,6 +38,7 @@ pub async fn handle_async(args: ArbArgs) -> Result<()> {
             tol_bps,
             min_edge_bps,
             fire,
+            custody,
             } => {
             crate::commands::arb_bridge::handle(
                 pools,
@@ -52,6 +53,7 @@ pub async fn handle_async(args: ArbArgs) -> Result<()> {
                     tol_bps,
                     min_edge_bps,
                     fire,
+                    custody,
                 },
             )
             .await?;

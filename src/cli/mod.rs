@@ -82,6 +82,9 @@ pub enum ArbCommands {
         /// fire run() after configure
         #[arg(long)]
         fire: bool,
+        /// custody mode: exchange.ts router (deposit + ledger) instead of dex.ts
+        #[arg(long)]
+        custody: bool,
     },
 }
 

@@ -13,7 +13,7 @@
 //! (integer cycle gate + per-leg min_out guards) — a mirror that lies, or a
 //! market that moved between snapshot and fire, gets trapped, not traded.
 //!
-//! near-mock binary is expected at ~/dev/lisp-rlm/target/release/near-mock
+//! near-mock binary is expected at ~/dev/near-mock/target/release/near-mock
 //! (the lisp-rlm release build emits it alongside the compiler).
 
 use anyhow::{bail, Context, Result};
@@ -34,6 +34,9 @@ pub(crate) struct BridgeCfg {
     pub(crate) tol_bps: i64,
     pub(crate) min_edge_bps: i64,
     pub(crate) fire: bool,
+    /// true = exchange.ts custody router (init_pool/fund_pool/quote by id,
+    /// deposit before fire, balance_of ledger check after) instead of dex.ts
+    pub(crate) custody: bool,
 }
 
 struct Leg {
@@ -185,7 +188,7 @@ pub(crate) async fn handle(ref_ids: Vec<u64>, _binance_ignored: Vec<String>, cfg
     // ── 4. mirror into the mock dex on near-mock ──────────────────────────
     let home = std::env::var("HOME").context("HOME unset")?;
     let nm = PathBuf::from(home)
-        .join("dev/lisp-rlm/target/release/near-mock");
+        .join("dev/near-mock/target/release/near-mock");
     if !nm.exists() {
         bail!("near-mock binary missing: {}", nm.display());
     }
@@ -199,17 +202,24 @@ pub(crate) async fn handle(ref_ids: Vec<u64>, _binance_ignored: Vec<String>, cfg
     let st = cfg.state.to_string_lossy().into_owned();
     let _ = std::fs::remove_file(&cfg.state); // fresh state each bridge run
 
-    println!("== mock dex ← live reserves (µ-scale) ==");
+    println!("== mock ← live reserves (µ-scale) ==");
+    // custody router (exchange.ts) keys pools by id with init_pool/fund_pool
+    let (m_init, m_fund, m_quote) = if cfg.custody {
+        ("init_pool", "fund_pool", "quote")
+    } else {
+        ("init", "fund", "quote")
+    };
     for l in &legs {
+        let kf = if cfg.custody { "id" } else { "key" };
         nm_call(
             &nm,
             &st,
             &man,
             &cfg.dex,
-            "init",
+            m_init,
             &format!(
-                "{{\"key\":\"{}\",\"base\":\"{}\",\"quote\":\"{}\",\"fee_bps\":{}}}",
-                l.key, l.base, l.quote, l.fee_bps
+                "{{\"{}\":\"{}\",\"base\":\"{}\",\"quote\":\"{}\",\"fee_bps\":{}}}",
+                kf, l.key, l.base, l.quote, l.fee_bps
             ),
         )?;
         nm_call(
@@ -217,10 +227,10 @@ pub(crate) async fn handle(ref_ids: Vec<u64>, _binance_ignored: Vec<String>, cfg
             &st,
             &man,
             &cfg.dex,
-            "fund",
+            m_fund,
             &format!(
-                "{{\"key\":\"{}\",\"side\":\"base\",\"amount\":{}}}",
-                l.key, l.r_base_micro
+                "{{\"{}\":\"{}\",\"side\":\"base\",\"amount\":{}}}",
+                kf, l.key, l.r_base_micro
             ),
         )?;
         nm_call(
@@ -228,10 +238,10 @@ pub(crate) async fn handle(ref_ids: Vec<u64>, _binance_ignored: Vec<String>, cfg
             &st,
             &man,
             &cfg.dex,
-            "fund",
+            m_fund,
             &format!(
-                "{{\"key\":\"{}\",\"side\":\"quote\",\"amount\":{}}}",
-                l.key, l.r_quote_micro
+                "{{\"{}\":\"{}\",\"side\":\"quote\",\"amount\":{}}}",
+                kf, l.key, l.r_quote_micro
             ),
         )?;
         println!(
@@ -256,14 +266,15 @@ pub(crate) async fn handle(ref_ids: Vec<u64>, _binance_ignored: Vec<String>, cfg
         let mut rates: Vec<i64> = Vec::new();
         let mut ok = true;
         for l in legs.iter() {
-            let ret = nm_call(
+                let ret = nm_call(
                 &nm,
                 &st,
                 &man,
                 &cfg.dex,
                 "quote",
                 &format!(
-                    "{{\"key\":\"{}\",\"side\":\"{}\",\"amount\":{}}}",
+                    "{{\"{}\":\"{}\",\"side\":\"{}\",\"amount\":{}}}",
+                    if cfg.custody { "id" } else { "key" },
                     l.key,
                     side_of(l),
                     amt
@@ -350,10 +361,50 @@ pub(crate) async fn handle(ref_ids: Vec<u64>, _binance_ignored: Vec<String>, cfg
     println!("configure → {ret}");
 
     if cfg.fire {
+        // custody mode: fund the brain's ledger BEFORE firing (real-custody
+        // seam; the router debits the caller's balance, not thin air)
+        if cfg.custody {
+            let funding = size * 110 / 100; // cap + 10% buffer for fees/rounding
+            let ret = nm_call(
+                &nm,
+                &st,
+                &man,
+                &cfg.dex,
+                "deposit",
+                &format!(
+                    "{{\"account\":\"{}\",\"token\":\"{}\",\"amount\":{}}}",
+                    cfg.brain,
+                    cycle.edges[0].from,
+                    funding
+                ),
+            )?;
+            println!("deposit → {} µ{} ledger", ret, cycle.edges[0].from);
+        }
         let ret = nm_call(&nm, &st, &man, &cfg.brain, "run", "{}")?;
         println!("run → {ret}");
         let status = nm_call(&nm, &st, &man, &cfg.brain, "status", "{}")?;
         println!("status → {status}");
+        // custody mode: ground truth is the LEDGER, not the brain's books
+        if cfg.custody && ret.starts_with("FIRED") {
+            let ledger = nm_call(
+                &nm,
+                &st,
+                &man,
+                &cfg.dex,
+                "balance_of",
+                &format!(
+                    "{{\"account\":\"{}\",\"token\":\"{}\"}}",
+                    cfg.brain,
+                    cycle.edges[0].from
+                ),
+            )?;
+            println!(
+                "ledger → {} µ{} (funded {} µ, pre-fire delta = realized P&L)",
+                ledger,
+                cycle.edges[0].from,
+                size * 110 / 100
+            );
+        }
         if ret.starts_with("FIRED") {
             let pos: i64 = status
                 .split_whitespace()
