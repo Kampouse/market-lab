@@ -25,9 +25,49 @@ pub async fn handle_async(args: ArbArgs) -> Result<()> {
         } => {
             crate::commands::arb_live::handle(pools, binance, capital, out).await?;
             Ok(())
-        }
+            }
+            ArbCommands::Bridge {
+            pools,
+            binance,
+            capital,
+            brain,
+            dex,
+            state,
+            dex_wasm,
+            brain_wasm,
+            tol_bps,
+            min_edge_bps,
+            fire,
+            } => {
+            crate::commands::arb_bridge::handle(
+                pools,
+                binance,
+                crate::commands::arb_bridge::BridgeCfg {
+                    capital,
+                    brain,
+                    dex,
+                    state,
+                    dex_wasm,
+                    brain_wasm,
+                    tol_bps,
+                    min_edge_bps,
+                    fire,
+                },
+            )
+            .await?;
+            Ok(())
+            }
         other => handle(ArbArgs { command: other }),
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub(crate) struct DclMeta {
+    pub(crate) pool_id: String,
+    pub(crate) token_x: String,
+    pub(crate) token_y: String,
+    pub(crate) fee: u32,
+    pub(crate) point: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -45,16 +85,26 @@ pub(crate) struct Pool {
     /// order-book top depth in base units: (bid_qty, ask_qty). None = no cap known.
     #[serde(default)]
     pub(crate) book_qty: Option<(f64, f64)>,
+    /// DCL pool identity + on-chain price point (price = 1.0001^point, decimals-adjusted).
+    #[serde(default)]
+    pub(crate) dcl: Option<DclMeta>,
 }
 
-struct Edge {
-    from: String,
-    to: String,
-    rate: f64,
-    pool: String,
-    venue: String,
-    side: &'static str,
-    px: f64,
+#[derive(Clone)]
+pub(crate) struct Edge {
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) rate: f64,
+    pub(crate) pool: String,
+    pub(crate) venue: String,
+    pub(crate) side: &'static str,
+    pub(crate) px: f64,
+}
+
+/// A found negative-weight cycle, rotated so edges[0].from is the entry token.
+pub(crate) struct Cycle {
+    pub(crate) edges: Vec<Edge>,
+    pub(crate) factor: f64,
 }
 
 fn cmd_sample(out: &Path) -> Result<()> {
@@ -69,6 +119,7 @@ fn cmd_sample(out: &Path) -> Result<()> {
             fee_bps: 1.0,
             cprod: None,
             book_qty: None,
+            dcl: None,
         },
         Pool {
             id: "p1".into(),
@@ -80,6 +131,7 @@ fn cmd_sample(out: &Path) -> Result<()> {
             fee_bps: 2.0,
             cprod: None,
             book_qty: None,
+            dcl: None,
         },
         Pool {
             id: "p2".into(),
@@ -91,6 +143,7 @@ fn cmd_sample(out: &Path) -> Result<()> {
             fee_bps: 2.0,
             cprod: None,
             book_qty: None,
+            dcl: None,
         },
     ];
     fs::write(out, serde_json::to_string_pretty(&pools)?)?;
@@ -146,8 +199,10 @@ pub(crate) fn exec_hop(p: &Pool, sell: bool, x: f64) -> f64 {
     }
 }
 
-/// Shared Bellman-Ford negative-cycle scan over a pool set.
-pub(crate) fn scan_pools(pools: &[Pool], capital: f64) -> Result<()> {
+/// Bellman-Ford negative-cycle search over a pool set. Returns the best cycle
+/// (rotated so edges[0].from is the entry token) or None when the graph is
+/// clean. Pure graph work — no printing, reusable by the bridge.
+pub(crate) fn find_cycle(pools: &[Pool]) -> Result<Option<Cycle>> {
     // Edges (price = quote per base):
     //   base→quote: sell base at bid   → rate = bid·(1-fee)
     //   quote→base: buy base at ask    → rate = (1-fee)/ask
@@ -208,12 +263,7 @@ pub(crate) fn scan_pools(pools: &[Pool], capital: f64) -> Result<()> {
             }
         }
         if !improved {
-            println!(
-                "no arbitrage: {} pools, {} edges, graph clean",
-                pools.len(),
-                edges.len()
-            );
-            return Ok(());
+            return Ok(None);
         }
     }
     ensure!(hit != usize::MAX, "relaxed {} iters with no cycle", n);
@@ -249,11 +299,34 @@ pub(crate) fn scan_pools(pools: &[Pool], capital: f64) -> Result<()> {
     cedges.rotate_left(bp);
 
     let mut factor = 1.0;
+    let mut out_edges = Vec::with_capacity(cedges.len());
+    for &ei in &cedges {
+        let e = edges[ei].clone();
+        factor *= e.rate;
+        out_edges.push(e);
+    }
+    Ok(Some(Cycle {
+        edges: out_edges,
+        factor,
+    }))
+}
+
+/// The original scan entry: find the cycle, then report it with depth-checked
+/// execution at `capital`.
+pub(crate) fn scan_pools(pools: &[Pool], capital: f64) -> Result<()> {
+    let Some(cycle) = find_cycle(pools)? else {
+        println!(
+            "no arbitrage: {} pools, {} edges, graph clean",
+            pools.len(),
+            pools.len() * 2
+        );
+        return Ok(());
+    };
+    println!("BEST CYCLE:");
+    let mut factor = 1.0;
     let mut exec = capital;
     let mut exec_ok = true;
-    println!("BEST CYCLE:");
-    for &ei in &cedges {
-        let e = &edges[ei];
+    for e in &cycle.edges {
         factor *= e.rate;
         if let Some(p) = pools.iter().find(|p| p.id == e.pool) {
             if exec_ok {
@@ -272,7 +345,7 @@ pub(crate) fn scan_pools(pools: &[Pool], capital: f64) -> Result<()> {
     }
     let bps = (factor - 1.0) * 10_000.0;
     println!("gross factor {:.6}  marginal {:+.1} bps", factor, bps);
-    let cur = &edges[cedges[0]].from;
+    let cur = &cycle.edges[0].from;
     if exec_ok {
         println!(
             "  depth-checked: {:.2} {} → {:.2} {} ({:+.1} bps real)",

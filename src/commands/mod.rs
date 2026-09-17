@@ -1,4 +1,5 @@
 pub mod arb;
+pub mod arb_bridge;
 pub mod arb_live;
 pub mod market;
 pub mod markets;

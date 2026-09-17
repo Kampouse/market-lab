@@ -47,6 +47,42 @@ pub enum ArbCommands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Live scan → on-chain brain: find an executable ON-CHAIN cycle, push it
+    /// into the lisp-rlm arb brain (examples/arb_live.ts) on near-mock via
+    /// configure, optionally fire run(). Capital is in micro-units (1e-6) of
+    /// the cycle's start token — the brain's native integer convention.
+    Bridge {
+        #[arg(long, value_delimiter = ',', default_value = "0,1,2,3,4,792,4299,4586")]
+        pools: Vec<u64>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "BTCUSDT,ETHUSDT,NEARUSDT,SOLUSDT,ETHBTC,SOLBTC,NEARBTC"
+        )]
+        binance: Vec<String>,
+        /// Capital in micro-units of the cycle start token (e.g. 2000000 = 2 USDC)
+        #[arg(long, default_value_t = 2_000_000)]
+        capital: i64,
+        #[arg(long, default_value = "arb.live.near")]
+        brain: String,
+        #[arg(long, default_value = "dex.live.near")]
+        dex: String,
+        #[arg(long, default_value = "/tmp/live_state.bin")]
+        state: PathBuf,
+        #[arg(long, default_value = "/tmp/dex.wasm")]
+        dex_wasm: PathBuf,
+        #[arg(long, default_value = "/tmp/arb_live.wasm")]
+        brain_wasm: PathBuf,
+        /// per-leg slippage tolerance pushed into the brain's guards (bps)
+        #[arg(long, default_value_t = 50)]
+        tol_bps: i64,
+        /// minimum expected cycle edge for the brain's own gate (bps)
+        #[arg(long, default_value_t = 10)]
+        min_edge_bps: i64,
+        /// fire run() after configure
+        #[arg(long)]
+        fire: bool,
+    },
 }
 
 #[derive(Args, Debug)]

@@ -21,7 +21,7 @@ const REF_CONTRACT: &str = "v2.ref-finance.near";
 const DEFAULT_REF_POOLS: &str = "0,1,2,3,4,792,4299,4586";
 const DEFAULT_BINANCE: &str = "BTCUSDT,ETHUSDT,NEARUSDT,SOLUSDT,ETHBTC,SOLBTC,NEARBTC";
 
-fn http() -> Result<reqwest::Client> {
+pub(crate) fn http() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -144,7 +144,7 @@ fn node_name(sym: &str) -> &str {
     }
 }
 
-async fn fetch_ref_pool(
+pub(crate) async fn fetch_ref_pool(
     http: &reqwest::Client,
     id: u64,
     meta_cache: &mut std::collections::HashMap<String, (String, u64)>,
@@ -198,10 +198,11 @@ async fn fetch_ref_pool(
         fee_bps: raw.total_fee,
         cprod: Some((a0, a1)),
         book_qty: None,
+        dcl: None,
     })
 }
 
-async fn fetch_binance(http: &reqwest::Client, symbols: &[&str]) -> Result<Vec<Pool>> {
+pub(crate) async fn fetch_binance(http: &reqwest::Client, symbols: &[&str]) -> Result<Vec<Pool>> {
     let mut pools = Vec::new();
     for &sym in symbols {
         // Depth endpoint: L1 prices for the graph, ±1%-band cumulative qty as
@@ -259,6 +260,7 @@ async fn fetch_binance(http: &reqwest::Client, symbols: &[&str]) -> Result<Vec<P
             fee_bps: 10.0, // taker
             cprod: None,
             book_qty: Some((band_bid, band_ask)),
+            dcl: None,
         });
     }
     Ok(pools)
@@ -324,6 +326,7 @@ pub async fn handle(
             fee_bps: 1.0,
             cprod: None,
             book_qty: None,
+            dcl: None,
         });
     }
 
