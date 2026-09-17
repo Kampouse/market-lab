@@ -1,3 +1,4 @@
+pub mod arb;
 pub mod market;
 pub mod markets;
 pub mod script;

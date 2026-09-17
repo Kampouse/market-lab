@@ -18,7 +18,30 @@ pub struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum ArbCommands {
+    /// Write a deterministic pools snapshot with a planted triangle cycle
+    Sample {
+        #[arg(long, default_value = "pools.json")]
+        out: PathBuf,
+    },
+    /// Bellman-Ford negative-cycle scan over a pools snapshot
+    Scan {
+        #[arg(long, default_value = "pools.json")]
+        file: PathBuf,
+        #[arg(long, default_value_t = 10_000.0)]
+        capital: f64,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct ArbArgs {
+    #[command(subcommand)]
+    pub command: ArbCommands,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum Commands {
+    Arb(ArbArgs),
     Markets(MarketsArgs),
     Inspect(InspectArgs),
     Replay(ReplayArgs),
