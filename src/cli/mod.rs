@@ -24,12 +24,28 @@ pub enum ArbCommands {
         #[arg(long, default_value = "pools.json")]
         out: PathBuf,
     },
-    /// Bellman-Ford negative-cycle scan over a pools snapshot
+    /// Bellman-Ford scan over a pools snapshot file
     Scan {
         #[arg(long, default_value = "pools.json")]
         file: PathBuf,
         #[arg(long, default_value_t = 10_000.0)]
         capital: f64,
+    },
+    /// Scan REAL market data: Binance bookTicker + on-chain Ref pools
+    Live {
+        #[arg(long, value_delimiter = ',', default_value = "0,1,2,3,4,792,4299,4586")]
+        pools: Vec<u64>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "BTCUSDT,ETHUSDT,NEARUSDT,SOLUSDT,ETHBTC,SOLBTC,NEARBTC"
+        )]
+        binance: Vec<String>,
+        #[arg(long, default_value_t = 10_000.0)]
+        capital: f64,
+        /// Also write the fetched pool snapshot to this file
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 

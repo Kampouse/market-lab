@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse_from(args);
 
     match cli.command {
-        Commands::Arb(args) => commands::arb::handle(args)?,
+        Commands::Arb(args) => commands::arb::handle_async(args).await?,
         Commands::Markets(args) => commands::markets::handle(args)?,
         Commands::Inspect(args) => commands::market::inspect::handle(args).await?,
         Commands::Replay(args) => commands::market::replay::handle(args).await?,
